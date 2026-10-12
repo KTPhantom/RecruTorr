@@ -55,6 +55,7 @@ from src.resume_parser import parse_resume
 from src.schemas import Profile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 CONSENT_TEXT = (
