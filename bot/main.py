@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hmac
 import io
 import json
 import logging
@@ -26,6 +27,8 @@ import sys
 import time
 from typing import Any, List, Optional
 
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -41,6 +44,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+import uvicorn
 
 from src import db, tracker
 from src.delivery import build_job_keyboard, format_job_card
@@ -211,8 +215,12 @@ async def jobs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     verified_jobs = db.get_verified_jobs(conn)
     if not verified_jobs:
-        await update.message.reply_text("No verified jobs in the database yet. Run the fetcher or check back later!")
-        return
+        await update.message.reply_text("Refreshing verified job listings now. Please wait a moment...")
+        await asyncio.to_thread(refresh_job_listings)
+        verified_jobs = db.get_verified_jobs(conn)
+        if not verified_jobs:
+            await update.message.reply_text("No verified jobs are available right now. Please try again later.")
+            return
 
     seen_rows = conn.execute(
         "SELECT job_id FROM applications WHERE user_id = ?",
@@ -251,8 +259,12 @@ async def jobs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(card_text.replace("*", "").replace("_", ""), reply_markup=kb)
 
         conn.execute(
-            """INSERT OR REPLACE INTO matches (user_id, job_id, score, fit_json, sent_at)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO matches (user_id, job_id, score, fit_json, sent_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, job_id) DO UPDATE SET
+                   score = excluded.score,
+                   fit_json = excluded.fit_json,
+                   sent_at = excluded.sent_at""",
             (str(uid), job.job_id, score, json.dumps(fit.to_dict()), now_str),
         )
         db.record_application_event(conn, str(uid), job.job_id, status="sent")
@@ -369,34 +381,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await status_msg.edit_text(f"❌ Failed to parse resume: {exc}. Please try again.")
 
 
-# ---------- Reminder Callback Worker ----------
-
-async def send_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fired by JobQueue when a 24-hour reminder expires."""
-    job_data = context.job.data if context.job else {}
-    chat_id = job_data.get("chat_id")
-    job_id = job_data.get("job_id")
-    if not chat_id or not job_id:
-        return
-
-    conn = db.get_db()
-    job = db.get_job_by_id(conn, job_id)
-    if not job:
-        return
-
-    msg = (
-        f"⏰ *Reminder: Don't miss this opportunity!*\n\n"
-        f"You asked to be reminded about:\n"
-        f"🎯 *{job.title}* at *{job.company}*\n"
-        f"📍 {job.location or 'Location not specified'}\n\n"
-        f"👉 [Click here to apply now]({job.apply_url})"
-    )
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
-    except Exception as exc:
-        log.error("Failed to send reminder to %s: %s", chat_id, exc)
-
-
 # ---------- Daily Morning Digest Worker ----------
 
 def refresh_job_listings() -> dict[str, Any]:
@@ -408,8 +392,8 @@ def refresh_job_listings() -> dict[str, Any]:
         conn.close()
 
 
-async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fired daily at 09:00 AM IST (03:30 UTC) to send fresh matches to active students."""
+async def scheduled_daily_digest(bot: Any) -> None:
+    """Refresh listings and send the daily digest to active students."""
     fetch_result = await asyncio.to_thread(refresh_job_listings)
     log.info(
         "Daily job refresh completed: fetched=%d verified=%d rejected=%d errors=%d",
@@ -449,7 +433,7 @@ async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         try:
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=uid,
                 text=f"🌅 *Good morning!* Here are {len(matches)} fresh verified openings matching your resume:",
                 parse_mode=ParseMode.MARKDOWN,
@@ -459,21 +443,54 @@ async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
                 fit = explain_match(profile, job, matched_skills, missing_skills)
                 card_text = format_job_card(job, fit)
                 kb = build_job_keyboard(job)
-                await context.bot.send_message(
+                await bot.send_message(
                     chat_id=uid,
                     text=card_text,
                     reply_markup=kb,
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 conn.execute(
-                    """INSERT OR REPLACE INTO matches (user_id, job_id, score, fit_json, sent_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                    """INSERT INTO matches (user_id, job_id, score, fit_json, sent_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(user_id, job_id) DO UPDATE SET
+                           score = excluded.score,
+                           fit_json = excluded.fit_json,
+                           sent_at = excluded.sent_at""",
                     (str(uid), job.job_id, score, json.dumps(fit.to_dict()), now_str),
                 )
                 db.record_application_event(conn, str(uid), job.job_id, status="sent")
             conn.commit()
         except Exception as exc:
             log.error("Failed sending daily digest to %s: %s", uid, exc)
+
+
+async def send_due_reminders(bot: Any) -> int:
+    """Deliver reminders persisted in the database, then mark successful sends."""
+    conn = db.get_db()
+    sent = 0
+    try:
+        for reminder in db.get_due_reminders(conn):
+            msg = (
+                "⏰ *Reminder: Don't miss this opportunity!*\n\n"
+                "You asked to be reminded about:\n"
+                f"🎯 *{reminder['title']}* at *{reminder['company']}*\n"
+                f"📍 {reminder['location'] or 'Location not specified'}\n\n"
+                f"👉 [Click here to apply now]({reminder['apply_url']})"
+            )
+            try:
+                await bot.send_message(
+                    chat_id=int(reminder["user_id"]),
+                    text=msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                log.error("Failed sending reminder to %s: %s", reminder["user_id"], exc)
+                continue
+            db.mark_reminder_sent(conn, reminder["user_id"], reminder["job_id"])
+            sent += 1
+    finally:
+        conn.close()
+    return sent
 
 
 # ---------- Button Callbacks ----------
@@ -567,15 +584,14 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         elif action == "remind":
             tracker.record_feedback(conn, str(uid), job_id, "remind")
-            # Schedule reminder via JobQueue in 24 hours (86400s)
-            if ctx.job_queue:
-                ctx.job_queue.run_once(
-                    send_reminder_job,
-                    when=86400,
-                    data={"chat_id": uid, "job_id": job_id},
-                    name=f"remind_{uid}_{job_id}",
-                )
-            await q.answer("⏰ Reminder scheduled! I will ping you in 24 hours.", show_alert=False)
+            due_at = (
+                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
+            ).isoformat(timespec="seconds")
+            db.schedule_reminder(conn, str(uid), job_id, due_at)
+            await q.answer(
+                "⏰ Reminder scheduled! I will ping you within about an hour after 24 hours.",
+                show_alert=False,
+            )
             if job and q.message:
                 try:
                     await q.edit_message_reply_markup(reply_markup=build_job_keyboard(job, "remind"))
@@ -594,16 +610,7 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 # ---------- Bot Startup & Command Registration ----------
 
 async def post_init(application: Application) -> None:
-    """Register command menu and setup automated daily digest schedule."""
-    fetch_result = await asyncio.to_thread(refresh_job_listings)
-    log.info(
-        "Initial job refresh completed: fetched=%d verified=%d rejected=%d errors=%d",
-        fetch_result["fetched"],
-        fetch_result["verified"],
-        fetch_result["rejected"],
-        len(fetch_result["errors"]),
-    )
-
+    """Register command menu."""
     commands = [
         BotCommand("start", "Start the bot & accept consent"),
         BotCommand("jobs", "Find fresh verified job matches"),
@@ -621,15 +628,83 @@ async def post_init(application: Application) -> None:
     except Exception as exc:
         log.warning("Could not register bot commands menu: %s", exc)
 
-    # Schedule automated daily morning digest at 09:00 AM IST (03:30 UTC)
-    if application.job_queue:
-        digest_time = datetime.time(hour=3, minute=30, tzinfo=datetime.timezone.utc)
-        application.job_queue.run_daily(
-            scheduled_daily_digest,
-            time=digest_time,
-            name="daily_morning_digest",
+def create_web_app(application: Application, webhook_secret: str, scheduler_secret: str) -> FastAPI:
+    web_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @web_app.get("/")
+    @web_app.get("/healthz")
+    async def health_check() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @web_app.post("/telegram")
+    async def receive_telegram_update(request: Request) -> dict[str, str]:
+        supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(supplied_secret, webhook_secret):
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
+        try:
+            payload = await request.json()
+            update = Update.de_json(payload, application.bot)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid Telegram update") from exc
+        await application.update_queue.put(update)
+        return {"status": "accepted"}
+
+    @web_app.post("/internal/run-scheduled")
+    async def run_scheduled_task(
+        request: Request,
+        x_scheduler_secret: str = Header(default="", alias="X-Scheduler-Secret"),
+    ) -> JSONResponse:
+        if not hmac.compare_digest(x_scheduler_secret, scheduler_secret):
+            raise HTTPException(status_code=403, detail="Invalid scheduler secret")
+        try:
+            payload = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Expected a JSON task") from exc
+        task = payload.get("task") if isinstance(payload, dict) else None
+        if task == "digest":
+            await scheduled_daily_digest(application.bot)
+            return JSONResponse({"task": task, "status": "completed"})
+        if task == "reminders":
+            sent = await send_due_reminders(application.bot)
+            return JSONResponse({"task": task, "status": "completed", "sent": sent})
+        raise HTTPException(status_code=400, detail="Task must be 'digest' or 'reminders'")
+
+    return web_app
+
+
+async def serve_webhook(application: Application) -> None:
+    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    webhook_secret = os.getenv("WEBHOOK_SECRET")
+    scheduler_secret = os.getenv("SCHEDULER_SECRET")
+    if not hostname or not webhook_secret or not scheduler_secret or not os.getenv("DATABASE_URL"):
+        raise RuntimeError(
+            "Render webhook mode requires RENDER_EXTERNAL_HOSTNAME, DATABASE_URL, WEBHOOK_SECRET, "
+            "and SCHEDULER_SECRET"
         )
-        log.info("Scheduled automated daily morning digest for 09:00 AM IST (03:30 UTC).")
+
+    await application.initialize()
+    try:
+        await post_init(application)
+        await application.start()
+        await application.bot.set_webhook(
+            url=f"https://{hostname}/telegram",
+            secret_token=webhook_secret,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        log.info("Telegram webhook registered for %s.", hostname)
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_web_app(application, webhook_secret, scheduler_secret),
+                host="0.0.0.0",
+                port=int(os.getenv("PORT", "10000")),
+                log_level="info",
+            )
+        )
+        await server.serve()
+    finally:
+        if application.running:
+            await application.stop()
+        await application.shutdown()
 
 
 def run_bot() -> None:
@@ -678,8 +753,12 @@ def run_bot() -> None:
     # Inline buttons
     app.add_handler(CallbackQueryHandler(on_button_callback))
 
-    log.info("Starting Telegram Bot listener...")
-    app.run_polling()
+    if os.getenv("RENDER_EXTERNAL_HOSTNAME"):
+        log.info("Starting Telegram webhook server...")
+        asyncio.run(serve_webhook(app))
+    else:
+        log.info("Starting Telegram Bot polling listener...")
+        app.run_polling()
 
 
 if __name__ == "__main__":

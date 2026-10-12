@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +14,10 @@ from src.schemas import Job, Profile
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "data.db")))
+_POSTGRES_SCHEMA_LOCK = threading.Lock()
+_POSTGRES_SCHEMA_INITIALIZED = False
 
-INIT_SCHEMA = """
+SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
     name TEXT,
@@ -89,26 +92,157 @@ CREATE TABLE IF NOT EXISTS runs (
     sent INTEGER DEFAULT 0,
     errors_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS reminders (
+    user_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    sent_at TEXT,
+    PRIMARY KEY (user_id, job_id)
+);
+"""
+
+POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    telegram_id BIGINT PRIMARY KEY,
+    name TEXT,
+    grad_year INTEGER,
+    consent_at TEXT,
+    paused INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP::text
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id TEXT PRIMARY KEY,
+    profile_json TEXT NOT NULL,
+    summary_embedding TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS companies (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    ats_type TEXT NOT NULL,
+    board_slug TEXT NOT NULL,
+    careers_url TEXT,
+    domains TEXT,
+    active INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    company TEXT NOT NULL,
+    title TEXT NOT NULL,
+    location TEXT,
+    remote INTEGER DEFAULT 0,
+    description TEXT,
+    apply_url TEXT NOT NULL,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    posted_at TEXT,
+    verified INTEGER DEFAULT 0,
+    reject_reason TEXT,
+    fresher_friendly INTEGER DEFAULT 1,
+    domains TEXT,
+    embedding TEXT,
+    fetched_at TEXT,
+    first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP::text
+);
+
+CREATE TABLE IF NOT EXISTS matches (
+    user_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    score DOUBLE PRECISION NOT NULL,
+    fit_json TEXT,
+    sent_at TEXT,
+    PRIMARY KEY (user_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS applications (
+    user_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id BIGSERIAL PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    fetched INTEGER DEFAULT 0,
+    verified INTEGER DEFAULT 0,
+    rejected INTEGER DEFAULT 0,
+    sent INTEGER DEFAULT 0,
+    errors_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    user_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    sent_at TEXT,
+    PRIMARY KEY (user_id, job_id)
+);
 """
 
 
-def get_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """Return an initialized SQLite connection with row factory configured."""
+class PostgresConnection:
+    """Small adapter for the SQLite-style execute calls used by the application."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, query: str, parameters: Any = ()) -> Any:
+        return self._connection.execute(query.replace("?", "%s"), parameters or ())
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def get_db(db_path: Optional[Path] = None) -> Any:
+    """Return an initialized database connection (PostgreSQL in deployment, SQLite locally)."""
+    global _POSTGRES_SCHEMA_INITIALIZED
+    database_url = os.getenv("DATABASE_URL") if db_path is None else None
+    if database_url:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        connection = psycopg.connect(database_url, row_factory=dict_row, connect_timeout=10)
+        postgres = PostgresConnection(connection)
+        if not _POSTGRES_SCHEMA_INITIALIZED:
+            try:
+                with _POSTGRES_SCHEMA_LOCK:
+                    if not _POSTGRES_SCHEMA_INITIALIZED:
+                        for statement in POSTGRES_SCHEMA.split(";"):
+                            if statement.strip():
+                                postgres.execute(statement)
+                        connection.commit()
+                        _POSTGRES_SCHEMA_INITIALIZED = True
+            except Exception:
+                connection.close()
+                raise
+        return postgres
+
     p = db_path or DB_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
-    conn.executescript(INIT_SCHEMA)
+    conn.executescript(SQLITE_SCHEMA)
     return conn
 
 
 # --- User & Profile Helpers ---
 
-def get_user(conn: sqlite3.Connection, telegram_id: int) -> Optional[sqlite3.Row]:
+def get_user(conn: Any, telegram_id: int) -> Optional[Any]:
     return conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
 
 
-def upsert_user(conn: sqlite3.Connection, telegram_id: int, name: str, consent_at: Optional[str] = None) -> None:
+def upsert_user(conn: Any, telegram_id: int, name: str, consent_at: Optional[str] = None) -> None:
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     conn.execute(
         """INSERT INTO users (telegram_id, name, consent_at, created_at)
@@ -121,13 +255,14 @@ def upsert_user(conn: sqlite3.Connection, telegram_id: int, name: str, consent_a
     conn.commit()
 
 
-def set_user_paused(conn: sqlite3.Connection, telegram_id: int, paused: bool) -> None:
+def set_user_paused(conn: Any, telegram_id: int, paused: bool) -> None:
     conn.execute("UPDATE users SET paused = ? WHERE telegram_id = ?", (1 if paused else 0, telegram_id))
     conn.commit()
 
 
-def delete_user_data(conn: sqlite3.Connection, telegram_id: int) -> None:
+def delete_user_data(conn: Any, telegram_id: int) -> None:
     uid = str(telegram_id)
+    conn.execute("DELETE FROM reminders WHERE user_id = ?", (uid,))
     conn.execute("DELETE FROM applications WHERE user_id = ?", (uid,))
     conn.execute("DELETE FROM matches WHERE user_id = ?", (uid,))
     conn.execute("DELETE FROM profiles WHERE user_id = ?", (uid,))
@@ -135,7 +270,7 @@ def delete_user_data(conn: sqlite3.Connection, telegram_id: int) -> None:
     conn.commit()
 
 
-def save_profile(conn: sqlite3.Connection, profile: Profile) -> None:
+def save_profile(conn: Any, profile: Profile) -> None:
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     emb_str = json.dumps(profile.summary_embedding) if profile.summary_embedding else None
     conn.execute(
@@ -150,7 +285,7 @@ def save_profile(conn: sqlite3.Connection, profile: Profile) -> None:
     conn.commit()
 
 
-def get_profile(conn: sqlite3.Connection, user_id: str) -> Optional[Profile]:
+def get_profile(conn: Any, user_id: str) -> Optional[Profile]:
     row = conn.execute("SELECT profile_json FROM profiles WHERE user_id = ?", (str(user_id),)).fetchone()
     if not row:
         return None
@@ -158,13 +293,13 @@ def get_profile(conn: sqlite3.Connection, user_id: str) -> Optional[Profile]:
     return Profile.from_dict(data)
 
 
-def get_all_active_users(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+def get_all_active_users(conn: Any) -> List[Any]:
     return conn.execute("SELECT * FROM users WHERE consent_at IS NOT NULL AND paused = 0").fetchall()
 
 
 # --- Job Helpers ---
 
-def save_jobs(conn: sqlite3.Connection, jobs: List[Job], domains: Optional[List[str]] = None) -> None:
+def save_jobs(conn: Any, jobs: List[Job], domains: Optional[List[str]] = None) -> None:
     for j in jobs:
         d = j.to_dict()
         emb_str = json.dumps(j.embedding) if j.embedding else None
@@ -199,12 +334,12 @@ def save_jobs(conn: sqlite3.Connection, jobs: List[Job], domains: Optional[List[
     conn.commit()
 
 
-def get_verified_jobs(conn: sqlite3.Connection) -> List[Job]:
+def get_verified_jobs(conn: Any) -> List[Job]:
     rows = conn.execute("SELECT * FROM jobs WHERE verified = 1").fetchall()
     return [Job.from_row(r) for r in rows]
 
 
-def get_job_by_id(conn: sqlite3.Connection, job_id: str) -> Optional[Job]:
+def get_job_by_id(conn: Any, job_id: str) -> Optional[Job]:
     row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
     if not row:
         return None
@@ -214,7 +349,7 @@ def get_job_by_id(conn: sqlite3.Connection, job_id: str) -> Optional[Job]:
 # --- Application & Tracking Helpers ---
 
 def record_application_event(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     job_id: str,
     status: str,
@@ -233,7 +368,7 @@ def record_application_event(
     conn.commit()
 
 
-def get_user_negative_feedback(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+def get_user_negative_feedback(conn: Any, user_id: str) -> Dict[str, Any]:
     """Retrieve companies and titles marked 'not_relevant' to down-weight in matching."""
     rows = conn.execute(
         """SELECT j.company, j.title FROM applications a
@@ -246,7 +381,7 @@ def get_user_negative_feedback(conn: sqlite3.Connection, user_id: str) -> Dict[s
     return {"companies": disliked_companies, "titles": disliked_titles}
 
 
-def get_user_applied_jobs(conn: sqlite3.Connection, user_id: str) -> List[sqlite3.Row]:
+def get_user_applied_jobs(conn: Any, user_id: str) -> List[Any]:
     return conn.execute(
         """SELECT j.title, j.company, j.apply_url, a.updated_at FROM applications a
            JOIN jobs j ON a.job_id = j.job_id
@@ -254,3 +389,35 @@ def get_user_applied_jobs(conn: sqlite3.Connection, user_id: str) -> List[sqlite
            ORDER BY a.updated_at DESC""",
         (str(user_id),),
     ).fetchall()
+
+
+def schedule_reminder(conn: Any, user_id: str, job_id: str, due_at: str) -> None:
+    conn.execute(
+        """INSERT INTO reminders (user_id, job_id, due_at, sent_at)
+           VALUES (?, ?, ?, NULL)
+           ON CONFLICT(user_id, job_id) DO UPDATE SET
+               due_at = excluded.due_at,
+               sent_at = NULL""",
+        (str(user_id), job_id, due_at),
+    )
+    conn.commit()
+
+
+def get_due_reminders(conn: Any) -> List[Any]:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return conn.execute(
+        """SELECT r.user_id, r.job_id, j.title, j.company, j.location, j.apply_url
+           FROM reminders r JOIN jobs j ON r.job_id = j.job_id
+           WHERE r.sent_at IS NULL AND r.due_at <= ?
+           ORDER BY r.due_at""",
+        (now,),
+    ).fetchall()
+
+
+def mark_reminder_sent(conn: Any, user_id: str, job_id: str) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "UPDATE reminders SET sent_at = ? WHERE user_id = ? AND job_id = ? AND sent_at IS NULL",
+        (now, str(user_id), job_id),
+    )
+    conn.commit()

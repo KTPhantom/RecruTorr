@@ -1,5 +1,6 @@
 """Unit tests for Database operations and data lifecycle."""
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 from src import db
 from src.schemas import Job, Profile
@@ -52,8 +53,19 @@ def test_db_lifecycle(tmp_path: Path):
     assert len(applied) == 1
     assert applied[0]["title"] == "Software Engineer Intern"
 
-    # 5. Delete user data (GDPR / privacy compliance)
+    # 5. Persist and send reminders even when the bot process was asleep.
+    due_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+    db.schedule_reminder(conn, "12345", job.job_id, due_at)
+    due_reminders = db.get_due_reminders(conn)
+    assert len(due_reminders) == 1
+    assert due_reminders[0]["title"] == "Software Engineer Intern"
+    db.mark_reminder_sent(conn, "12345", job.job_id)
+    assert db.get_due_reminders(conn) == []
+
+    # 6. Delete user data (GDPR / privacy compliance)
+    db.schedule_reminder(conn, "12345", job.job_id, due_at)
     db.delete_user_data(conn, 12345)
     assert db.get_user(conn, 12345) is None
     assert db.get_profile(conn, "12345") is None
     assert len(db.get_user_applied_jobs(conn, "12345")) == 0
+    assert db.get_due_reminders(conn) == []

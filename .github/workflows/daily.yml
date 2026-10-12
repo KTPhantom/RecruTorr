@@ -1,29 +1,47 @@
 name: Daily OffCampus Matcher Pipeline
 
 on:
+  schedule:
+    - cron: '30 3 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      task:
+        description: Scheduled action to trigger
+        required: true
+        type: choice
+        options:
+          - reminders
+          - digest
 
 jobs:
-  run-pipeline:
+  trigger-render-task:
     runs-on: ubuntu-latest
+    concurrency:
+      group: recru-torr-scheduled-task
+      cancel-in-progress: false
+    env:
+      RENDER_APP_URL: ${{ secrets.RENDER_APP_URL }}
+      SCHEDULER_SECRET: ${{ secrets.SCHEDULER_SECRET }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
+      - name: Wake the Render service and run the scheduled task
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -z "$RENDER_APP_URL" ] || [ -z "$SCHEDULER_SECRET" ]; then
+            echo "Set the RENDER_APP_URL and SCHEDULER_SECRET repository secrets."
+            exit 1
+          fi
 
-      - name: Run Fetch and Verify
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          python -m src.run_fetch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            task="${{ inputs.task }}"
+          elif [ "${{ github.event.schedule }}" = "30 3 * * *" ]; then
+            task="digest"
+          else
+            task="reminders"
+          fi
+
+          curl --fail --silent --show-error \
+            --retry 8 --retry-all-errors --retry-delay 15 --max-time 840 \
+            -H "Content-Type: application/json" \
+            -H "X-Scheduler-Secret: $SCHEDULER_SECRET" \
+            --data "{\"task\":\"$task\"}" \
+            "${RENDER_APP_URL%/}/internal/run-scheduled"

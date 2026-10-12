@@ -13,7 +13,7 @@ A zero-cost, privacy-first Telegram bot that delivers authentic, verified off-ca
 5. **Explainer (`src/explainer.py`)**: Writes honest 1-2 line fit notes (matched vs. missing skills).
 6. **Delivery (`src/delivery.py`)**: Formats daily Telegram digests with interactive action buttons (**Apply**, **Applied**, **Not relevant**, **Remind me**).
 7. **Tracker (`src/tracker.py`)**: Logs interactions and automatically down-weights disliked roles/companies for subsequent runs.
-8. **Orchestrator (`src/orchestrator.py`)**: Coordinates the daily automated cron pipeline and execution logging in SQLite.
+8. **Orchestrator (`src/orchestrator.py`)**: Coordinates the daily job-fetch pipeline and execution logging in SQLite locally or PostgreSQL when deployed.
 
 ---
 
@@ -54,13 +54,26 @@ python -m bot.main
    - Check `/applied` to view all jobs you have marked as applied.
    - Run `/delete` anytime to delete all your personal data.
 
-### Deploy on Render
+### Free deployment on Render
 
-1. In Render, create a new **Blueprint** from this repository and apply the included `render.yaml`.
-2. Add `TELEGRAM_BOT_TOKEN` in the service's environment settings. `OPENAI_API_KEY` is optional; without it, resume parsing and match explanations use deterministic fallbacks.
-3. Deploy the `recru-torr-bot` background worker. Its persistent disk stores the SQLite database, user profiles, and fetched jobs across restarts.
+This setup uses a Render free web service, a free Neon PostgreSQL database, and GitHub Actions for scheduled work. It avoids Render's paid worker and persistent disk. Free services can sleep, so Telegram webhooks and scheduled tasks may be delayed while Render wakes the service.
 
-The worker fetches and verifies job listings when it starts and before its daily 9:00 AM IST digest. The GitHub Actions workflow can still be run manually, but it uses a separate temporary database and does not update the Render worker's data.
+1. Create a free PostgreSQL project at [Neon](https://neon.com/) and copy its connection string (use the pooled connection string and keep its SSL parameters).
+2. Push this repository to GitHub, then in Render choose **New + → Blueprint** and select this repository's `main` branch. Apply the included `render.yaml`; confirm that the service plan is **Free**.
+3. In Render's `recru-torr-bot` environment settings, set:
+   - `DATABASE_URL`: the Neon connection string.
+   - `TELEGRAM_BOT_TOKEN`: your token from [@BotFather](https://t.me/BotFather).
+   - `WEBHOOK_SECRET`: a random secret containing only letters, numbers, `_`, or `-`.
+   - `SCHEDULER_SECRET`: a separate random secret.
+   - `OPENAI_API_KEY` is optional; deterministic fallbacks are used when it is absent.
+4. After the first successful deploy, copy the service's public URL, such as `https://recru-torr-bot.onrender.com`.
+5. In GitHub, open **Settings → Secrets and variables → Actions → New repository secret** and add:
+   - `RENDER_APP_URL`: the Render public URL, without a trailing slash.
+   - `SCHEDULER_SECRET`: exactly the same value set in Render.
+6. Run **Actions → Daily OffCampus Matcher Pipeline → Run workflow**, select `digest`, and run it once to fetch jobs and send the first digest. The schedule runs a digest daily at 09:00 IST and checks reminders hourly.
+7. Open the bot in Telegram, send `/start`, accept the privacy notice, upload a PDF resume, and try `/jobs`.
+
+Render automatically provides the public hostname used to register the Telegram webhook. Do not add `DATABASE_URL` or either secret to the repository. The free Render filesystem is temporary; user profiles, preferences, and jobs are stored in Neon instead. Neon Free currently advertises no credit card requirement, but its compute can scale to zero; Render free services can also sleep, so wake-ups and scheduled delivery are best-effort, not an always-on production guarantee.
 
 ---
 

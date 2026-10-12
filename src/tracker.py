@@ -6,7 +6,6 @@ manages reminders, and adjusts future ranking weights based on user feedback.
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +15,7 @@ log = logging.getLogger(__name__)
 
 
 def record_feedback(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     job_id: str,
     action: str,
@@ -38,6 +37,6 @@ def record_feedback(
         return "Action saved."
 
 
-def get_feedback_weights(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+def get_feedback_weights(conn: Any, user_id: str) -> Dict[str, Any]:
     """Retrieve negative feedback data for adjusting ranking in the Matcher."""
     return get_user_negative_feedback(conn, user_id)

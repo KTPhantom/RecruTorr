@@ -130,8 +130,12 @@ async def deliver_matches_for_users(conn: Any, bot_app: Optional[Any] = None) ->
 
             # Record match in DB
             conn.execute(
-                """INSERT OR REPLACE INTO matches (user_id, job_id, score, fit_json, sent_at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO matches (user_id, job_id, score, fit_json, sent_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, job_id) DO UPDATE SET
+                       score = excluded.score,
+                       fit_json = excluded.fit_json,
+                       sent_at = excluded.sent_at""",
                 (str(telegram_id), job.job_id, score, json.dumps(fit.to_dict()), now_str),
             )
             # Mark application state as 'sent'

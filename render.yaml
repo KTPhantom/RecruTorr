@@ -1,20 +1,21 @@
 services:
-  - type: worker
+  - type: web
     name: recru-torr-bot
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python -m bot.main
-    disk:
-      name: recru-torr-data
-      mountPath: /var/data
-      sizeGB: 1
+    healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
-      - key: DB_PATH
-        value: /var/data/data.db
+      - key: DATABASE_URL
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: SCHEDULER_SECRET
         sync: false
       - key: OPENAI_API_KEY
         sync: false
