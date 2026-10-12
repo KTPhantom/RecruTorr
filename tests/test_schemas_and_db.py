@@ -1,0 +1,59 @@
+"""Unit tests for Database operations and data lifecycle."""
+from pathlib import Path
+
+from src import db
+from src.schemas import Job, Profile
+
+
+def test_db_lifecycle(tmp_path: Path):
+    test_db_path = tmp_path / "test.db"
+    conn = db.get_db(test_db_path)
+
+    # 1. Upsert user
+    db.upsert_user(conn, 12345, "Rohan")
+    u = db.get_user(conn, 12345)
+    assert u is not None
+    assert u["name"] == "Rohan"
+    assert u["paused"] == 0
+
+    # 2. Save and retrieve Profile
+    prof = Profile(
+        user_id="12345",
+        name="Rohan",
+        grad_year=2026,
+        skills=["python", "pytorch"],
+        target_roles=["ml", "sde"],
+    )
+    db.save_profile(conn, prof)
+    retrieved = db.get_profile(conn, "12345")
+    assert retrieved is not None
+    assert retrieved.name == "Rohan"
+    assert "pytorch" in retrieved.skills
+
+    # 3. Save Jobs
+    job = Job(
+        company="Razorpay",
+        title="Software Engineer Intern",
+        location="Bengaluru",
+        description="Python backend",
+        apply_url="https://jobs.lever.co/razorpay/101",
+        source="lever",
+        external_id="101",
+        verified=True,
+    )
+    db.save_jobs(conn, [job])
+    v_jobs = db.get_verified_jobs(conn)
+    assert len(v_jobs) == 1
+    assert v_jobs[0].job_id == job.job_id
+
+    # 4. Record application event
+    db.record_application_event(conn, "12345", job.job_id, status="applied")
+    applied = db.get_user_applied_jobs(conn, "12345")
+    assert len(applied) == 1
+    assert applied[0]["title"] == "Software Engineer Intern"
+
+    # 5. Delete user data (GDPR / privacy compliance)
+    db.delete_user_data(conn, 12345)
+    assert db.get_user(conn, 12345) is None
+    assert db.get_profile(conn, "12345") is None
+    assert len(db.get_user_applied_jobs(conn, "12345")) == 0
