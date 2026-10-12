@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from src.schemas import Job, Profile
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "data.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "data.db")))
 
 INIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS runs (
 def get_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     """Return an initialized SQLite connection with row factory configured."""
     p = db_path or DB_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
     conn.executescript(INIT_SCHEMA)

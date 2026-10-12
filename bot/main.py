@@ -16,6 +16,7 @@ Features:
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import io
 import json
@@ -45,6 +46,7 @@ from src import db, tracker
 from src.delivery import build_job_keyboard, format_job_card
 from src.explainer import explain_match
 from src.matcher import match_for_user
+from src.orchestrator import fetch_and_verify_all
 from src.resume_parser import parse_resume
 from src.schemas import Profile
 
@@ -397,8 +399,25 @@ async def send_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- Daily Morning Digest Worker ----------
 
+def refresh_job_listings() -> dict[str, Any]:
+    """Fetch and verify current listings using the bot's configured database."""
+    conn = db.get_db()
+    try:
+        return fetch_and_verify_all(conn)
+    finally:
+        conn.close()
+
+
 async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fired daily at 09:00 AM IST (03:30 UTC) to send fresh matches to active students."""
+    fetch_result = await asyncio.to_thread(refresh_job_listings)
+    log.info(
+        "Daily job refresh completed: fetched=%d verified=%d rejected=%d errors=%d",
+        fetch_result["fetched"],
+        fetch_result["verified"],
+        fetch_result["rejected"],
+        len(fetch_result["errors"]),
+    )
     conn = db.get_db()
     active_users = db.get_all_active_users(conn)
     verified_jobs = db.get_verified_jobs(conn)
@@ -576,6 +595,15 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 async def post_init(application: Application) -> None:
     """Register command menu and setup automated daily digest schedule."""
+    fetch_result = await asyncio.to_thread(refresh_job_listings)
+    log.info(
+        "Initial job refresh completed: fetched=%d verified=%d rejected=%d errors=%d",
+        fetch_result["fetched"],
+        fetch_result["verified"],
+        fetch_result["rejected"],
+        len(fetch_result["errors"]),
+    )
+
     commands = [
         BotCommand("start", "Start the bot & accept consent"),
         BotCommand("jobs", "Find fresh verified job matches"),

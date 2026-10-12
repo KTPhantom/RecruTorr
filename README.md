@@ -54,6 +54,14 @@ python -m bot.main
    - Check `/applied` to view all jobs you have marked as applied.
    - Run `/delete` anytime to delete all your personal data.
 
+### Deploy on Render
+
+1. In Render, create a new **Blueprint** from this repository and apply the included `render.yaml`.
+2. Add `TELEGRAM_BOT_TOKEN` in the service's environment settings. `OPENAI_API_KEY` is optional; without it, resume parsing and match explanations use deterministic fallbacks.
+3. Deploy the `recru-torr-bot` background worker. Its persistent disk stores the SQLite database, user profiles, and fetched jobs across restarts.
+
+The worker fetches and verifies job listings when it starts and before its daily 9:00 AM IST digest. The GitHub Actions workflow can still be run manually, but it uses a separate temporary database and does not update the Render worker's data.
+
 ---
 
 ## 🧪 Running Tests
