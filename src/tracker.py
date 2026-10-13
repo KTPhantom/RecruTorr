@@ -29,6 +29,8 @@ def record_feedback(
     
     if action == "applied":
         return "🎉 Marked as applied! We'll keep track of this under /applied."
+    elif action == "liked":
+        return "💚 Thanks! We'll prioritize similar roles in future matches."
     elif action == "not_relevant":
         return "👍 Got it. We will down-rank this role and company for your future matches."
     elif action == "remind":

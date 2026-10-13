@@ -1,8 +1,13 @@
 # Companies configuration for OffCampus Matcher
-# ATS types supported: greenhouse | lever | ashby
-# slug: the part after the board URL
+# ATS types supported: greenhouse | lever | ashby | smartrecruiters
+# slug: provider board slug/company identifier from its public careers URL
 
 companies:
+  # Example SmartRecruiters entry:
+  # - name: Example Company
+  #   ats: smartrecruiters
+  #   slug: company-identifier
+  #   domains: ["example.com"]
   - name: GitLab
     ats: greenhouse
     slug: gitlab
@@ -17,6 +22,26 @@ companies:
     ats: greenhouse
     slug: stripe
     domains: ["stripe.com", "greenhouse.io"]
+
+  - name: Cloudflare
+    ats: greenhouse
+    slug: cloudflare
+    domains: ["cloudflare.com", "greenhouse.io"]
+
+  - name: Datadog
+    ats: greenhouse
+    slug: datadog
+    domains: ["datadoghq.com", "greenhouse.io"]
+
+  - name: Twilio
+    ats: greenhouse
+    slug: twilio
+    domains: ["twilio.com", "greenhouse.io"]
+
+  - name: Reddit
+    ats: greenhouse
+    slug: reddit
+    domains: ["reddit.com", "greenhouse.io"]
 
   - name: Spotify
     ats: lever

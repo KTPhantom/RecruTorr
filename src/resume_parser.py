@@ -136,13 +136,20 @@ def parse_resume_with_llm(
 ) -> Optional[Profile]:
     """Parse resume text using OpenAI or OpenAI-compatible LLM endpoint."""
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    if not api_key or os.getenv("LLM_RESUME_PARSING_ENABLED", "").lower() not in {
+        "1", "true", "yes"
+    }:
         return None
 
     try:
         from openai import OpenAI
         base_url = os.getenv("OPENAI_BASE_URL")
-        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url if base_url else None,
+            timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "8")),
+            max_retries=0,
+        )
 
         prompt = (
             "You are a strict resume parsing agent. Extract structured profile data from the resume text.\n"

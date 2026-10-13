@@ -57,6 +57,7 @@ from src.schemas import Profile
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
+_job_refresh_task: Optional[asyncio.Task[Any]] = None
 
 CONSENT_TEXT = (
     "👋 *Welcome to OffCampus Matcher!*\n\n"
@@ -137,7 +138,11 @@ async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"• *Degree:* {profile.degree}\n"
         f"• *Grad Year:* {profile.grad_year}\n"
         f"• *Target Roles:* {roles_str}\n"
+        f"• *Custom Titles:* {', '.join(profile.custom_titles) or 'None'}\n"
         f"• *Locations:* {loc_str}\n"
+        f"• *Work Modes:* {', '.join(profile.work_modes) or 'Any'}\n"
+        f"• *Job Types:* {', '.join(profile.job_types) or 'Any'}\n"
+        f"• *Digest Frequency:* {profile.digest_frequency.replace('_', ' ')}\n"
         f"• *Extracted Skills ({len(profile.skills)}):* {skills_str}\n\n"
         f"💡 _Tip: Use `/preferences` to customize locations & roles, or upload a new PDF anytime to refresh._"
     )
@@ -145,44 +150,139 @@ async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def build_preferences_keyboard(profile: Profile) -> InlineKeyboardMarkup:
-    """Build toggle buttons for location and role preferences."""
-    all_locations = ["remote", "bangalore", "delhi", "hyderabad", "pune"]
-    all_roles = ["sde", "backend", "frontend", "ml", "data"]
+    """Build preference toggles and custom-entry actions."""
+    all_locations = [
+        "remote", "bangalore", "delhi", "hyderabad", "pune", "mumbai",
+        "chennai", "kolkata", "ahmedabad",
+    ]
+    all_roles = [
+        "sde", "backend", "frontend", "ml", "data", "qa",
+        "product", "ios", "android", "devops", "security", "design",
+    ]
+    all_modes = ["remote", "hybrid", "onsite"]
+    all_types = ["internship", "full_time", "contract", "part_time"]
+    all_frequencies = ["daily", "weekly", "on_demand"]
 
     current_locs = {loc.lower() for loc in profile.locations}
     current_roles = {role.lower() for role in profile.target_roles}
+    current_modes = {mode.lower() for mode in profile.work_modes}
+    current_types = {job_type.lower() for job_type in profile.job_types}
 
-    # Location buttons row
-    loc_buttons = []
-    for loc in all_locations:
-        active = loc in current_locs
-        label = f"{'✅' if active else '➕'} {loc.capitalize()}"
-        loc_buttons.append(InlineKeyboardButton(label, callback_data=f"pref:loc:{loc}"))
+    def rows(options: list[str], active_values: set[str], kind: str) -> list[list[InlineKeyboardButton]]:
+        buttons = [
+            InlineKeyboardButton(
+                f"{'✅' if value in active_values else '➕'} {value.replace('_', ' ').title()}",
+                callback_data=f"pref:{kind}:{value}",
+            )
+            for value in options
+        ]
+        return [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
 
-    # Role buttons row
-    role_buttons = []
-    for r in all_roles:
-        active = r in current_roles
-        label = f"{'✅' if active else '➕'} {r.upper()}"
-        role_buttons.append(InlineKeyboardButton(label, callback_data=f"pref:role:{r}"))
-
-    # Split into 2 buttons per row for nice UI
-    kb = [
-        [loc_buttons[0], loc_buttons[1]],
-        [loc_buttons[2], loc_buttons[3]],
-        [loc_buttons[4]],
-        [InlineKeyboardButton("--- Target Roles ---", callback_data="noop")],
-        [role_buttons[0], role_buttons[1]],
-        [role_buttons[2], role_buttons[3]],
-        [role_buttons[4]],
-        [InlineKeyboardButton("🔍 Done, Show My Matches (/jobs)", callback_data="pref:done")],
-    ]
+    kb = [[InlineKeyboardButton("— Locations —", callback_data="noop")]]
+    kb.extend(rows(all_locations, current_locs, "loc"))
+    for index, location in enumerate(profile.locations):
+        if location.lower() not in all_locations:
+            kb.append([
+                InlineKeyboardButton(
+                    f"✖ {location[:32]}",
+                    callback_data=f"pref:remove_loc:{index}",
+                )
+            ])
+    kb.append([InlineKeyboardButton("➕ Add city", callback_data="pref:add_city")])
+    kb.append([InlineKeyboardButton("— Target roles —", callback_data="noop")])
+    kb.extend(rows(all_roles, current_roles, "role"))
+    for index, title in enumerate(profile.custom_titles):
+        kb.append([
+            InlineKeyboardButton(
+                f"✖ {title[:32]}",
+                callback_data=f"pref:remove_title:{index}",
+            )
+        ])
+    kb.append([InlineKeyboardButton("➕ Add custom job title", callback_data="pref:add_title")])
+    kb.append([InlineKeyboardButton("— Work mode —", callback_data="noop")])
+    kb.extend(rows(all_modes, current_modes, "mode"))
+    kb.append([InlineKeyboardButton("— Job type —", callback_data="noop")])
+    kb.extend(rows(all_types, current_types, "type"))
+    kb.append([InlineKeyboardButton("— Digest frequency —", callback_data="noop")])
+    kb.append([
+        InlineKeyboardButton(
+            f"{'✅' if profile.digest_frequency == value else '▫️'} {value.replace('_', ' ').title()}",
+            callback_data=f"pref:frequency:{value}",
+        )
+        for value in all_frequencies
+    ])
+    kb.append([InlineKeyboardButton("✅ Done", callback_data="pref:done")])
     return InlineKeyboardMarkup(kb)
+
+
+def preferences_summary(profile: Profile) -> str:
+    """Render the saved settings above the preference keyboard."""
+    return (
+        "⚙️ *Your job preferences*\n\n"
+        f"📍 Locations: {', '.join(profile.locations) or 'Any location'}\n"
+        f"🎯 Role groups: {', '.join(profile.target_roles) or 'Any role'}\n"
+        f"✍️ Custom titles: {', '.join(profile.custom_titles) or 'None'}\n"
+        f"🏢 Work modes: {', '.join(profile.work_modes) or 'Any'}\n"
+        f"💼 Job types: {', '.join(profile.job_types) or 'Any'}\n\n"
+        f"📨 Digest frequency: {profile.digest_frequency.replace('_', ' ')}\n\n"
+        "Tap choices to toggle them. Add custom cities or titles using the buttons below. "
+        "You can change these any time with /preferences."
+    )
+
+
+def merge_saved_preferences(profile: Profile, saved: Optional[Profile]) -> Profile:
+    """Keep user-selected settings when a new resume is parsed."""
+    if saved and saved.preferences_configured:
+        for field_name in (
+            "target_roles",
+            "custom_titles",
+            "locations",
+            "work_modes",
+            "job_types",
+        ):
+            setattr(profile, field_name, getattr(saved, field_name))
+        profile.digest_frequency = saved.digest_frequency
+        profile.preferences_configured = True
+    return profile
+
+
+def should_send_digest(profile: Profile, now: Optional[datetime.datetime] = None) -> bool:
+    """Check the user's configured digest cadence, using Monday as the weekly send day."""
+    if profile.digest_frequency == "on_demand":
+        return False
+    if profile.digest_frequency == "weekly":
+        ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        current = now or datetime.datetime.now(ist)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=ist)
+        return current.astimezone(ist).weekday() == 0
+    return True
+
+
+def build_feedback_reason_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    reasons = [
+        ("Role mismatch", "role"),
+        ("Location", "location"),
+        ("Experience", "experience"),
+        ("Pay / stipend", "pay"),
+        ("Other", "other"),
+    ]
+    buttons = [
+        InlineKeyboardButton(
+            label,
+            callback_data=f"act:reason:{job_id}:{reason}",
+        )
+        for label, reason in reasons
+    ]
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("Cancel", callback_data="noop")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def preferences_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    ctx.user_data.pop("pending_preference", None)
     uid = update.effective_user.id
     conn = db.get_db()
     profile = db.get_profile(conn, str(uid))
@@ -190,13 +290,163 @@ async def preferences_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         profile = Profile(user_id=str(uid), name=update.effective_user.first_name or "Student")
         db.save_profile(conn, profile)
 
-    kb = build_preferences_keyboard(profile)
-    text = (
-        "⚙️ *Customize Your Preferences:*\n\n"
-        "Tap the buttons below to toggle your preferred locations and target role families. "
-        "Your matches will update immediately!"
+    message = await update.message.reply_text(
+        preferences_summary(profile),
+        reply_markup=build_preferences_keyboard(profile),
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    ctx.user_data["preferences_message_id"] = message.message_id
+    ctx.user_data["preferences_chat_id"] = message.chat_id
+
+
+async def handle_preference_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save custom city/title values after the user taps an add button."""
+    if not update.message or not ctx.user_data.get("pending_preference"):
+        return
+    pending = ctx.user_data.pop("pending_preference")
+    values = [value.strip()[:60] for value in update.message.text.split(",") if value.strip()]
+    if not values:
+        await update.message.reply_text("Please send a non-empty value, or use /preferences to cancel.")
+        ctx.user_data["pending_preference"] = pending
+        return
+
+    uid = update.effective_user.id
+    conn = db.get_db()
+    profile = db.get_profile(conn, str(uid)) or Profile(
+        user_id=str(uid),
+        name=update.effective_user.first_name or "Student",
+    )
+    field_values = profile.locations if pending == "locations" else profile.custom_titles
+    known_values = {value.casefold() for value in field_values}
+    new_values = [value for value in values if value.casefold() not in known_values]
+    if len(field_values) + len(new_values) > 15:
+        await update.message.reply_text(
+            "Please keep up to 15 custom cities or job titles. Remove an existing choice and try again."
+        )
+        ctx.user_data["pending_preference"] = pending
+        return
+    field_values.extend(new_values)
+    if pending == "locations":
+        profile.locations = field_values
+    else:
+        profile.custom_titles = field_values
+    profile.preferences_configured = True
+    db.save_profile(conn, profile)
+
+    chat_id = ctx.user_data.get("preferences_chat_id")
+    message_id = ctx.user_data.get("preferences_message_id")
+    if chat_id and message_id:
+        await ctx.bot.edit_message_text(
+            preferences_summary(profile),
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=build_preferences_keyboard(profile),
+        )
+    await update.message.reply_text("✅ Saved. Your matching preferences are updated.")
+
+
+def _start_job_refresh() -> asyncio.Task[Any]:
+    """Start one shared background refresh for all users with an empty cache."""
+    global _job_refresh_task
+    if _job_refresh_task is None or _job_refresh_task.done():
+        _job_refresh_task = asyncio.create_task(asyncio.to_thread(refresh_job_listings))
+    return _job_refresh_task
+
+
+async def _refresh_then_send_matches(
+    bot: Any,
+    chat_id: int,
+    user_id: int,
+    refresh_task: asyncio.Task[Any],
+) -> None:
+    try:
+        await refresh_task
+    except Exception:
+        log.exception("Initial job refresh failed for user %s", user_id)
+        await bot.send_message(
+            chat_id=chat_id,
+            text="I couldn't refresh job listings right now. Please try /jobs again shortly.",
+        )
+        return
+
+    conn = db.get_db()
+    try:
+        profile = db.get_profile(conn, str(user_id)) or Profile(user_id=str(user_id))
+        verified_jobs = db.get_verified_jobs(conn)
+    finally:
+        conn.close()
+    await _send_job_matches(bot, chat_id, user_id, profile, verified_jobs)
+
+
+async def _send_job_matches(
+    bot: Any,
+    chat_id: int,
+    user_id: int,
+    profile: Profile,
+    verified_jobs: list[Any],
+) -> None:
+    conn = db.get_db()
+    try:
+        seen_rows = conn.execute(
+            "SELECT job_id FROM applications WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchall()
+        seen_ids = {r["job_id"] for r in seen_rows}
+        negative_feedback = db.get_user_negative_feedback(conn, str(user_id))
+        matches = match_for_user(
+            profile=profile,
+            verified_jobs=verified_jobs,
+            already_seen_ids=seen_ids,
+            negative_feedback=negative_feedback,
+            limit=5,
+        )
+
+        if not matches:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✨ *No new matches for these preferences yet.* "
+                    "Try /preferences to broaden your filters, or check /jobs again later."
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"🔍 Found {len(matches)} fresh verified match(es) for you:",
+        )
+        now_str = time.strftime("%Y-%m-%dT%H:%M:%S")
+        for job, score, matched_skills, missing_skills in matches:
+            fit = explain_match(profile, job, matched_skills, missing_skills)
+            card_text = format_job_card(job, fit)
+            keyboard = build_job_keyboard(job)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=card_text,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=card_text.replace("*", "").replace("_", ""),
+                    reply_markup=keyboard,
+                )
+            conn.execute(
+                """INSERT INTO matches (user_id, job_id, score, fit_json, sent_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, job_id) DO UPDATE SET
+                       score = excluded.score,
+                       fit_json = excluded.fit_json,
+                       sent_at = excluded.sent_at""",
+                (str(user_id), job.job_id, score, json.dumps(fit.to_dict()), now_str),
+            )
+            db.record_application_event(conn, str(user_id), job.job_id, status="sent")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def jobs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -204,73 +454,35 @@ async def jobs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     uid = update.effective_user.id
     conn = db.get_db()
-    user = db.get_user(conn, uid)
-
-    if not user or not user["consent_at"]:
-        await update.message.reply_text("Please run /start and accept the consent notice first.")
-        return
-
-    profile = db.get_profile(conn, str(uid))
-    if not profile:
-        profile = Profile(user_id=str(uid), name=update.effective_user.first_name or "Student")
-
-    verified_jobs = db.get_verified_jobs(conn)
-    if not verified_jobs:
-        await update.message.reply_text("Refreshing verified job listings now. Please wait a moment...")
-        await asyncio.to_thread(refresh_job_listings)
-        verified_jobs = db.get_verified_jobs(conn)
-        if not verified_jobs:
-            await update.message.reply_text("No verified jobs are available right now. Please try again later.")
+    try:
+        user = db.get_user(conn, uid)
+        if not user or not user["consent_at"]:
+            await update.message.reply_text("Please run /start and accept the consent notice first.")
             return
 
-    seen_rows = conn.execute(
-        "SELECT job_id FROM applications WHERE user_id = ?",
-        (str(uid),),
-    ).fetchall()
-    seen_ids = {r["job_id"] for r in seen_rows}
+        profile = db.get_profile(conn, str(uid))
+        if not profile:
+            profile = Profile(user_id=str(uid), name=update.effective_user.first_name or "Student")
+        verified_jobs = db.get_verified_jobs(conn)
+    finally:
+        conn.close()
 
-    negative_feedback = db.get_user_negative_feedback(conn, str(uid))
-
-    matches = match_for_user(
-        profile=profile,
-        verified_jobs=verified_jobs,
-        already_seen_ids=seen_ids,
-        negative_feedback=negative_feedback,
-        limit=5,
-    )
-
-    if not matches:
+    if not verified_jobs:
         await update.message.reply_text(
-            "✨ *You're all caught up!* No new unreviewed matches right now.\n"
-            "We check for new openings every morning at 9:00 AM IST. Check back tomorrow!"
+            "There are no cached listings yet. I'm refreshing the job boards now and will send your matches here when ready."
+        )
+        refresh_task = _start_job_refresh()
+        ctx.application.create_task(
+            _refresh_then_send_matches(
+                ctx.bot,
+                update.effective_chat.id,
+                uid,
+                refresh_task,
+            )
         )
         return
 
-    await update.message.reply_text(f"🔍 Found {len(matches)} fresh verified match(es) for you:")
-
-    now_str = time.strftime("%Y-%m-%dT%H:%M:%S")
-    for job, score, matched_skills, missing_skills in matches:
-        fit = explain_match(profile, job, matched_skills, missing_skills)
-        card_text = format_job_card(job, fit)
-        kb = build_job_keyboard(job)
-
-        try:
-            await update.message.reply_text(card_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await update.message.reply_text(card_text.replace("*", "").replace("_", ""), reply_markup=kb)
-
-        conn.execute(
-            """INSERT INTO matches (user_id, job_id, score, fit_json, sent_at)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(user_id, job_id) DO UPDATE SET
-                   score = excluded.score,
-                   fit_json = excluded.fit_json,
-                   sent_at = excluded.sent_at""",
-            (str(uid), job.job_id, score, json.dumps(fit.to_dict()), now_str),
-        )
-        db.record_application_event(conn, str(uid), job.job_id, status="sent")
-
-    conn.commit()
+    await _send_job_matches(ctx.bot, update.effective_chat.id, uid, profile, verified_jobs)
 
 
 async def applied_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,7 +561,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Please run /start and accept the privacy notice before uploading.")
         return
 
-    status_msg = await update.message.reply_text("📥 Analyzing and parsing your resume with AI...")
+    status_msg = await update.message.reply_text("📥 Reading and parsing your resume...")
 
     try:
         tg_file = await ctx.bot.get_file(doc.file_id)
@@ -357,11 +569,13 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await tg_file.download_to_memory(buffer)
         buffer.seek(0)
 
+        existing_profile = db.get_profile(conn, str(uid))
         profile = parse_resume(
             pdf_source=buffer,
             user_id=str(uid),
             form_answers={"name": update.effective_user.first_name or "Student"},
         )
+        profile = merge_saved_preferences(profile, existing_profile)
         db.save_profile(conn, profile)
 
         skills_summary = ", ".join(profile.skills[:8]) if profile.skills else "None detected"
@@ -413,6 +627,8 @@ async def scheduled_daily_digest(bot: Any) -> None:
         uid = u["telegram_id"]
         profile = db.get_profile(conn, str(uid))
         if not profile:
+            continue
+        if not should_send_digest(profile):
             continue
 
         seen_rows = conn.execute(
@@ -515,12 +731,27 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await q.answer()
         if rest == "yes":
             db.upsert_user(conn, uid, q.from_user.first_name or "User")
+            profile = db.get_profile(conn, str(uid)) or Profile(
+                user_id=str(uid),
+                name=q.from_user.first_name or "Student",
+            )
+            db.save_profile(conn, profile)
             welcome_msg = (
                 "🎉 *Thank you for consenting!*\n\n"
-                "Next step: **Upload your resume PDF directly in this chat**.\n\n"
-                "Or, type `/preferences` to customize your target roles and locations, or `/jobs` to browse openings right away!"
+                "Let's personalize your matches. Set roles, cities, and work preferences now, "
+                "or skip and upload your resume whenever you're ready."
             )
-            await q.edit_message_text(welcome_msg, parse_mode=ParseMode.MARKDOWN)
+            kb = InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("⚙️ Set preferences", callback_data="pref:open"),
+                    InlineKeyboardButton("Skip for now", callback_data="pref:skip"),
+                ]]
+            )
+            await q.edit_message_text(
+                welcome_msg,
+                reply_markup=kb,
+                parse_mode=ParseMode.MARKDOWN,
+            )
         else:
             await q.edit_message_text("No problem. No information was recorded.")
 
@@ -530,42 +761,115 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         if not profile:
             profile = Profile(user_id=str(uid), name=q.from_user.first_name or "Student")
 
-        if sub == "loc":
-            locs = list(profile.locations)
-            if val in locs:
-                locs.remove(val)
-                await q.answer(f"Removed {val.capitalize()} from locations")
-            else:
-                locs.append(val)
-                await q.answer(f"Added {val.capitalize()} to locations")
-            profile.locations = locs
-            db.save_profile(conn, profile)
-            await q.edit_message_reply_markup(reply_markup=build_preferences_keyboard(profile))
+        if sub == "open":
+            await q.answer()
+            if q.message:
+                ctx.user_data["preferences_message_id"] = q.message.message_id
+                ctx.user_data["preferences_chat_id"] = q.message.chat_id
+                await q.edit_message_text(
+                    preferences_summary(profile),
+                    reply_markup=build_preferences_keyboard(profile),
+                )
 
-        elif sub == "role":
-            roles = list(profile.target_roles)
-            if val in roles:
-                roles.remove(val)
-                await q.answer(f"Removed {val.upper()} from target roles")
+        elif sub == "skip":
+            await q.answer()
+            await q.edit_message_text(
+                "No problem. Upload your resume when ready, or use /preferences later. "
+                "Use /jobs to browse when listings are available."
+            )
+
+        elif sub in {"add_city", "add_title"}:
+            ctx.user_data["pending_preference"] = (
+                "locations" if sub == "add_city" else "custom_titles"
+            )
+            if q.message:
+                ctx.user_data["preferences_message_id"] = q.message.message_id
+                ctx.user_data["preferences_chat_id"] = q.message.chat_id
+            prompt = (
+                "Send the city or cities you want, separated by commas."
+                if sub == "add_city"
+                else "Send the job title or titles you want, separated by commas."
+            )
+            await q.answer()
+            if q.message:
+                await q.message.reply_text(prompt)
+
+        elif sub in {"loc", "role", "mode", "type"}:
+            fields = {
+                "loc": ("locations", "locations"),
+                "role": ("target_roles", "roles"),
+                "mode": ("work_modes", "work modes"),
+                "type": ("job_types", "job types"),
+            }
+            field_name, label = fields[sub]
+            values = list(getattr(profile, field_name))
+            matching = next((item for item in values if item.casefold() == val.casefold()), None)
+            if matching is not None:
+                values.remove(matching)
+                response = f"Removed {val.replace('_', ' ')} from {label}"
             else:
-                roles.append(val)
-                await q.answer(f"Added {val.upper()} to target roles")
-            profile.target_roles = roles
+                values.append(val)
+                response = f"Added {val.replace('_', ' ')} to {label}"
+            setattr(profile, field_name, values)
+            profile.preferences_configured = True
             db.save_profile(conn, profile)
-            await q.edit_message_reply_markup(reply_markup=build_preferences_keyboard(profile))
+            await q.answer(response)
+            if q.message:
+                await q.edit_message_text(
+                    preferences_summary(profile),
+                    reply_markup=build_preferences_keyboard(profile),
+                )
+
+        elif sub in {"remove_loc", "remove_title"}:
+            field_name = "locations" if sub == "remove_loc" else "custom_titles"
+            values = list(getattr(profile, field_name))
+            try:
+                index = int(val)
+                removed = values.pop(index)
+            except (ValueError, IndexError):
+                await q.answer("That preference is no longer available.", show_alert=True)
+                return
+            setattr(profile, field_name, values)
+            profile.preferences_configured = True
+            db.save_profile(conn, profile)
+            await q.answer(f"Removed {removed}")
+            if q.message:
+                await q.edit_message_text(
+                    preferences_summary(profile),
+                    reply_markup=build_preferences_keyboard(profile),
+                )
+
+        elif sub == "frequency":
+            if val not in {"daily", "weekly", "on_demand"}:
+                await q.answer("That digest frequency is unavailable.", show_alert=True)
+                return
+            profile.digest_frequency = val
+            profile.preferences_configured = True
+            db.save_profile(conn, profile)
+            await q.answer(f"Digest frequency set to {val.replace('_', ' ')}.")
+            if q.message:
+                await q.edit_message_text(
+                    preferences_summary(profile),
+                    reply_markup=build_preferences_keyboard(profile),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
 
         elif sub == "done":
+            profile.preferences_configured = True
+            db.save_profile(conn, profile)
             await q.answer("Preferences saved!")
             await q.edit_message_text(
-                "✅ *Preferences updated!*\nType `/jobs` to see newly filtered matches.",
+                "✅ *Preferences saved!*\nType `/jobs` to see matches with your updated settings. "
+                "Use /preferences any time to change them.",
                 parse_mode=ParseMode.MARKDOWN,
             )
 
     elif kind == "act":
-        action, _, job_id = rest.partition(":")
-        job = db.get_job_by_id(conn, job_id)
+        action, _, action_value = rest.partition(":")
 
         if action == "applied":
+            job_id = action_value
+            job = db.get_job_by_id(conn, job_id)
             tracker.record_feedback(conn, str(uid), job_id, "applied")
             await q.answer("🎉 Marked as applied! Tracked under /applied", show_alert=False)
             if job and q.message:
@@ -575,15 +879,55 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     pass
 
         elif action == "not_relevant":
-            tracker.record_feedback(conn, str(uid), job_id, "not_relevant")
-            await q.answer("👍 Down-voted! We will show fewer roles like this.", show_alert=False)
+            job = db.get_job_by_id(conn, action_value)
+            if not job:
+                await q.answer("This job is no longer available.", show_alert=True)
+                return
+            await q.answer("What didn't fit? Your answer will help tune future matches.")
+            if q.message:
+                await q.edit_message_reply_markup(
+                    reply_markup=build_feedback_reason_keyboard(action_value)
+                )
+
+        elif action == "reason":
+            job_id, _, reason = action_value.partition(":")
+            reason_labels = {
+                "role": "role mismatch",
+                "location": "location",
+                "experience": "experience level",
+                "pay": "pay or stipend",
+                "other": "other",
+            }
+            if reason not in reason_labels:
+                await q.answer("That feedback option is unavailable.", show_alert=True)
+                return
+            job = db.get_job_by_id(conn, job_id)
+            tracker.record_feedback(
+                conn,
+                str(uid),
+                job_id,
+                "not_relevant",
+                reason=reason,
+            )
+            await q.answer(f"Thanks — noted: {reason_labels[reason]}.")
             if job and q.message:
-                try:
-                    await q.edit_message_reply_markup(reply_markup=build_job_keyboard(job, "not_relevant"))
-                except Exception:
-                    pass
+                await q.edit_message_reply_markup(
+                    reply_markup=build_job_keyboard(job, "not_relevant")
+                )
+
+        elif action == "like":
+            job_id = action_value
+            job = db.get_job_by_id(conn, job_id)
+            tracker.record_feedback(conn, str(uid), job_id, "liked")
+            await q.answer("💚 Thanks! We'll prioritize similar roles.")
+            if job and q.message:
+                await q.edit_message_reply_markup(
+                    reply_markup=build_job_keyboard(job, "liked")
+                )
 
         elif action == "remind":
+            job_id = action_value
+            job = db.get_job_by_id(conn, job_id)
             tracker.record_feedback(conn, str(uid), job_id, "remind")
             due_at = (
                 datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
@@ -750,6 +1094,7 @@ def run_bot() -> None:
 
     # Document upload for resumes
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_preference_text))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(on_button_callback))

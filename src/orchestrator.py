@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,7 +23,7 @@ import yaml
 from src import db
 from src.delivery import build_job_keyboard, format_job_card
 from src.explainer import explain_match
-from src.fetchers import ashby, greenhouse, lever
+from src.fetchers import ashby, greenhouse, lever, smartrecruiters
 from src.matcher import match_for_user
 from src.schemas import Job, Profile
 from src.verifier import verify_and_deduplicate
@@ -32,6 +32,37 @@ log = logging.getLogger("orchestrator")
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPANIES_FILE = ROOT / "companies.yaml"
+MAX_CONCURRENT_FETCHES = 5
+
+
+def _fetch_company_board(company: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch one configured board and return timing/error data without touching the DB."""
+    name = company.get("name")
+    ats = company.get("ats")
+    slug = company.get("slug")
+    started = time.perf_counter()
+    try:
+        if ats == "greenhouse":
+            jobs = greenhouse.fetch(name, slug)
+        elif ats == "lever":
+            jobs = lever.fetch(name, slug, eu=company.get("eu", False))
+        elif ats == "ashby":
+            jobs = ashby.fetch(name, slug)
+        elif ats == "smartrecruiters":
+            jobs = smartrecruiters.fetch(name, slug)
+        else:
+            raise ValueError(f"Unsupported ATS type '{ats}'")
+        return {
+            "jobs": jobs,
+            "error": None,
+            "elapsed": time.perf_counter() - started,
+        }
+    except Exception as exc:
+        return {
+            "jobs": [],
+            "error": str(exc),
+            "elapsed": time.perf_counter() - started,
+        }
 
 
 def fetch_and_verify_all(conn: Any, companies_config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -49,40 +80,63 @@ def fetch_and_verify_all(conn: Any, companies_config_path: Optional[Path] = None
     total_rejected = 0
     errors = []
 
-    for c in companies:
+    configured = [
+        (index, company)
+        for index, company in enumerate(companies)
+        if company.get("name") and company.get("ats") and company.get("slug")
+    ]
+    fetched_by_index: Dict[int, Dict[str, Any]] = {}
+    if configured:
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_CONCURRENT_FETCHES, len(configured))
+        ) as executor:
+            futures = {
+                executor.submit(_fetch_company_board, company): index
+                for index, company in configured
+            }
+            for future in as_completed(futures):
+                fetched_by_index[futures[future]] = future.result()
+
+    for index, c in configured:
         name = c.get("name")
         ats = c.get("ats")
-        slug = c.get("slug")
         domains = c.get("domains", [])
-        if not name or not ats or not slug:
+        fetched = fetched_by_index[index]
+        if fetched["error"]:
+            log.error(
+                "Failed fetching %s (%s) after %.2fs: %s",
+                name,
+                ats,
+                fetched["elapsed"],
+                fetched["error"],
+            )
+            errors.append({"company": name, "ats": ats, "error": fetched["error"]})
             continue
-
-        raw_jobs: List[Job] = []
-        try:
-            if ats == "greenhouse":
-                raw_jobs = greenhouse.fetch(name, slug)
-            elif ats == "lever":
-                raw_jobs = lever.fetch(name, slug, eu=c.get("eu", False))
-            elif ats == "ashby":
-                raw_jobs = ashby.fetch(name, slug)
-            else:
-                raise ValueError(f"Unsupported ATS type '{ats}'")
-            total_fetched += len(raw_jobs)
-        except Exception as exc:
-            log.error("Failed fetching %s (%s): %s", name, ats, exc)
-            errors.append({"company": name, "ats": ats, "error": str(exc)})
-            continue
+        raw_jobs: List[Job] = fetched["jobs"]
+        total_fetched += len(raw_jobs)
+        log.info(
+            "Fetched %s (%s): %d jobs in %.2fs",
+            name,
+            ats,
+            len(raw_jobs),
+            fetched["elapsed"],
+        )
 
         # Run Verifier on raw jobs
+        verify_started = time.perf_counter()
         verified_batch = verify_and_deduplicate(raw_jobs, allowed_domains=domains)
         db.save_jobs(conn, verified_batch, domains=domains)
+        log.info(
+            "Verified %s: %d jobs in %.2fs",
+            name,
+            len(verified_batch),
+            time.perf_counter() - verify_started,
+        )
 
         v_count = sum(1 for j in verified_batch if j.verified)
         r_count = len(verified_batch) - v_count
         total_verified += v_count
         total_rejected += r_count
-
-        time.sleep(0.3)  # Rate limiting courtesy
 
     return {
         "fetched": total_fetched,

@@ -24,12 +24,24 @@ def test_db_lifecycle(tmp_path: Path):
         grad_year=2026,
         skills=["python", "pytorch"],
         target_roles=["ml", "sde"],
+        custom_titles=["iOS Developer"],
+        locations=["Pune"],
+        work_modes=["hybrid"],
+        job_types=["internship"],
+        digest_frequency="weekly",
+        preferences_configured=True,
     )
     db.save_profile(conn, prof)
     retrieved = db.get_profile(conn, "12345")
     assert retrieved is not None
     assert retrieved.name == "Rohan"
     assert "pytorch" in retrieved.skills
+    assert retrieved.custom_titles == ["iOS Developer"]
+    assert retrieved.locations == ["Pune"]
+    assert retrieved.work_modes == ["hybrid"]
+    assert retrieved.job_types == ["internship"]
+    assert retrieved.digest_frequency == "weekly"
+    assert retrieved.preferences_configured is True
 
     # 3. Save Jobs
     job = Job(
@@ -52,6 +64,20 @@ def test_db_lifecycle(tmp_path: Path):
     applied = db.get_user_applied_jobs(conn, "12345")
     assert len(applied) == 1
     assert applied[0]["title"] == "Software Engineer Intern"
+
+    db.record_application_event(
+        conn,
+        "12345",
+        job.job_id,
+        status="not_relevant",
+        reason="location",
+    )
+    feedback = db.get_user_negative_feedback(conn, "12345")
+    assert feedback["locations"] == ["bengaluru"]
+    db.record_application_event(conn, "12345", job.job_id, status="liked")
+    feedback = db.get_user_negative_feedback(conn, "12345")
+    assert feedback["liked_companies"] == {"razorpay"}
+    assert feedback["liked_titles"] == ["software engineer intern"]
 
     # 5. Persist and send reminders even when the bot process was asleep.
     due_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")

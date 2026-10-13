@@ -59,7 +59,12 @@ def generate_llm_explanation(
     try:
         from openai import OpenAI
         base_url = os.getenv("OPENAI_BASE_URL")
-        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url if base_url else None,
+            timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "8")),
+            max_retries=0,
+        )
 
         prompt = (
             "You are an honest career advisor for college freshers.\n"
@@ -117,10 +122,9 @@ def explain_match(
     m_skills = matched_skills or []
     miss_skills = missing_skills or []
 
-    # Try LLM first if API key configured
-    llm_result = generate_llm_explanation(profile, job, m_skills, miss_skills)
-    if llm_result and llm_result.fit_summary:
-        return llm_result
+    if os.getenv("LLM_EXPLANATIONS_ENABLED", "").lower() in {"1", "true", "yes"}:
+        llm_result = generate_llm_explanation(profile, job, m_skills, miss_skills)
+        if llm_result and llm_result.fit_summary:
+            return llm_result
 
-    # Fallback to deterministic rules
     return generate_rule_based_explanation(profile, job, m_skills, miss_skills)

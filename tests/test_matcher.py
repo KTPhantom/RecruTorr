@@ -92,3 +92,85 @@ def test_ranking_and_matching():
     assert matched_job.company == "TechCorp"
     assert "python" in matched_skills
     assert score > 0.0
+
+
+def test_custom_location_role_work_mode_and_job_type_preferences():
+    profile = Profile(
+        user_id="user456",
+        locations=["Pune"],
+        custom_titles=["iOS Developer"],
+        work_modes=["hybrid"],
+        job_types=["internship"],
+    )
+    matching_job = Job(
+        company="Example Co",
+        title="iOS Developer Intern",
+        location="Pune, India",
+        description="Hybrid internship using Swift.",
+        apply_url="https://jobs.lever.co/example/1",
+        source="lever",
+        external_id="hybrid-intern",
+        verified=True,
+    )
+    remote_job = Job(
+        company="Example Co",
+        title="iOS Developer Intern",
+        location="Remote",
+        description="Remote internship using Swift.",
+        apply_url="https://jobs.lever.co/example/2",
+        source="lever",
+        external_id="remote-intern",
+        remote=True,
+        verified=True,
+    )
+    full_time_job = Job(
+        company="Example Co",
+        title="iOS Developer",
+        location="Pune, India",
+        description="Hybrid full-time role using Swift.",
+        apply_url="https://jobs.lever.co/example/3",
+        source="lever",
+        external_id="hybrid-fulltime",
+        verified=True,
+    )
+
+    matches = match_for_user(profile, [matching_job, remote_job, full_time_job])
+
+    assert [match[0].external_id for match in matches] == ["hybrid-intern"]
+
+
+def test_positive_feedback_boosts_similar_company():
+    from src.matcher import score_jobs
+
+    profile = Profile(user_id="feedback-user", skills=["python"], target_roles=["sde"])
+    liked = Job(
+        company="Liked Co",
+        title="Software Engineer",
+        location="Remote",
+        description="Python software engineer",
+        apply_url="https://jobs.lever.co/liked/1",
+        source="lever",
+        external_id="liked",
+        remote=True,
+        verified=True,
+    )
+    other = Job(
+        company="Other Co",
+        title="Software Engineer",
+        location="Remote",
+        description="Python software engineer",
+        apply_url="https://jobs.lever.co/other/1",
+        source="lever",
+        external_id="other",
+        remote=True,
+        verified=True,
+    )
+
+    scores = score_jobs(
+        profile,
+        [liked, other],
+        negative_feedback={"liked_companies": {"liked co"}},
+    )
+
+    assert scores[0][0].company == "Liked Co"
+    assert scores[0][1] > scores[1][1]

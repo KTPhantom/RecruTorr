@@ -6,7 +6,7 @@ A zero-cost, privacy-first Telegram bot that delivers authentic, verified off-ca
 
 ## 🛠️ System Architecture
 
-1. **Source Fetchers (`src/fetchers/`)**: Pulls jobs from Greenhouse, Lever, and Ashby public ATS endpoints.
+1. **Source Fetchers (`src/fetchers/`)**: Pulls jobs from Greenhouse, Lever, Ashby, and SmartRecruiters public job-board endpoints.
 2. **Verifier (`src/verifier.py`)**: Deterministic rules rejecting scams/fees, stale postings (>30d), unauthorized domains, senior roles (3+ yrs), and duplicates.
 3. **Resume Parser (`src/resume_parser.py`)**: Converts uploaded PDF resumes into structured `Profile` JSON (LLM with deterministic fallback).
 4. **Matcher (`src/matcher.py`)**: Applies hard filters (role family, location/remote, dealbreakers, avoided companies) and ranks with TF-IDF similarity + skill-overlap boost + feedback penalties.
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ```
 
 ### 2. Configure Companies
-Edit `companies.yaml` to specify company names, ATS types (`greenhouse`, `lever`, `ashby`), board slugs, and allowed domains.
+Edit `companies.yaml` to specify company names, ATS types (`greenhouse`, `lever`, `ashby`, `smartrecruiters`), board slugs/company identifiers, and allowed domains. The included config has additional Greenhouse boards (Cloudflare, Datadog, Twilio, Reddit). For SmartRecruiters, the identifier is the company slug in its career-site URL (for example, `careers.smartrecruiters.com/<identifier>`). Add only board identifiers and domains that you have verified.
 
 ### 3. Fetch & Verify Jobs
 Run the daily fetch and verification pipeline:
@@ -49,8 +49,10 @@ python -m bot.main
 
 3. In Telegram:
    - Send `/start` and accept the consent notice.
+   - Optionally set role, city, work-mode, job-type, and digest-frequency preferences in the guided setup. `/preferences` lets you edit them later and add custom cities or job titles. Weekly digests arrive on Monday in India Standard Time; on-demand mode disables automatic digests but keeps `/jobs` available.
    - Upload your resume PDF directly in the chat to extract your profile and skills.
    - Run `/jobs` to browse matched openings with fit notes and action buttons.
+   - Tap **Not relevant** and choose a reason, or use **More like this**, to tune future recommendations.
    - Check `/applied` to view all jobs you have marked as applied.
    - Run `/delete` anytime to delete all your personal data.
 
@@ -65,7 +67,7 @@ This setup uses a Render free web service, a free Neon PostgreSQL database, and 
    - `TELEGRAM_BOT_TOKEN`: your token from [@BotFather](https://t.me/BotFather).
    - `WEBHOOK_SECRET`: a random secret containing only letters, numbers, `_`, or `-`.
    - `SCHEDULER_SECRET`: a separate random secret.
-   - `OPENAI_API_KEY` is optional; deterministic fallbacks are used when it is absent.
+   - `OPENAI_API_KEY` is optional. To avoid per-match network delays, fit notes use deterministic rules by default. Set `LLM_EXPLANATIONS_ENABLED=true` to opt in to model-generated fit notes. Resume parsing remains heuristic by default; set `LLM_RESUME_PARSING_ENABLED=true` to opt in. Optional LLM requests have an 8-second timeout and no automatic retries; use a model available to your provider.
 4. After the first successful deploy, copy the service's public URL, such as `https://recru-torr-bot.onrender.com`.
 5. In GitHub, open **Settings → Secrets and variables → Actions → New repository secret** and add:
    - `RENDER_APP_URL`: the Render public URL, without a trailing slash.

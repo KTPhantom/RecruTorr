@@ -39,15 +39,15 @@ def matches_location(job: Job, preferred_locations: List[str]) -> bool:
     """Check if job matches location preferences or is remote."""
     if not preferred_locations:
         return True
-    if job.remote:
-        return True
-    
     loc_clean = (job.location or "").lower()
-    for pref in preferred_locations:
-        pref_clean = pref.lower().strip()
-        if pref_clean in ["remote", "any", "wfh", "anywhere"]:
-            if job.remote:
-                return True
+    normalized_preferences = {pref.lower().strip() for pref in preferred_locations}
+    if normalized_preferences & {"any", "anywhere"}:
+        return True
+    if job.remote and normalized_preferences & {"remote", "wfh"}:
+        return True
+    for pref_clean in normalized_preferences:
+        if pref_clean in {"remote", "wfh"}:
+            continue
         elif pref_clean in loc_clean:
             return True
         else:
@@ -58,9 +58,13 @@ def matches_location(job: Job, preferred_locations: List[str]) -> bool:
     return False
 
 
-def matches_role_family(job: Job, target_roles: List[str]) -> bool:
+def matches_role_family(
+    job: Job,
+    target_roles: List[str],
+    custom_titles: Optional[List[str]] = None,
+) -> bool:
     """Check if job title or description matches user target roles."""
-    if not target_roles:
+    if not target_roles and not custom_titles:
         return True
     
     blob = f"{job.title} {job.description[:400]}".lower()
@@ -72,7 +76,17 @@ def matches_role_family(job: Job, target_roles: List[str]) -> bool:
         "ml": ["machine learning", "ai", "deep learning", "nlp", "computer vision", "data scientist"],
         "qa": ["qa", "quality assurance", "test engineer", "automation tester", "sdet"],
         "product": ["product manager", "product associate", "apm", "associate product manager"],
+        "ios": ["ios", "swift", "iphone"],
+        "android": ["android", "kotlin"],
+        "devops": ["devops", "site reliability", "sre", "platform engineer"],
+        "security": ["security engineer", "cybersecurity", "application security"],
+        "design": ["product designer", "ux designer", "ui designer"],
     }
+
+    for title in custom_titles or []:
+        title_clean = title.lower().strip()
+        if title_clean and re.search(r"\b" + re.escape(title_clean) + r"\b", blob):
+            return True
 
     for role in target_roles:
         role_key = role.lower().strip()
@@ -81,6 +95,37 @@ def matches_role_family(job: Job, target_roles: List[str]) -> bool:
             return True
 
     return False
+
+
+def matches_work_mode(job: Job, preferred_modes: List[str]) -> bool:
+    """Apply optional remote, hybrid, or on-site preferences."""
+    if not preferred_modes:
+        return True
+    text = f"{job.title} {job.location} {job.description}".lower()
+    if job.remote or re.search(r"\bremote\b|\bwork from home\b|\bwfh\b|\banywhere\b", text):
+        mode = "remote"
+    elif re.search(r"\bhybrid\b", text):
+        mode = "hybrid"
+    else:
+        mode = "onsite"
+    return mode in {item.lower().replace("-", "").replace("_", "") for item in preferred_modes}
+
+
+def matches_job_type(job: Job, preferred_types: List[str]) -> bool:
+    """Apply optional internship, full-time, contract, and part-time preferences."""
+    if not preferred_types:
+        return True
+    text = f"{job.title} {job.description}".lower()
+    if re.search(r"\bintern(?:ship)?\b", text):
+        job_type = "internship"
+    elif re.search(r"\bcontract(?:or)?\b|\bfreelance\b|\btemporary\b", text):
+        job_type = "contract"
+    elif re.search(r"\bpart[- ]time\b", text):
+        job_type = "part_time"
+    else:
+        job_type = "full_time"
+    normalized = {item.lower().replace("-", "").replace("_", "") for item in preferred_types}
+    return job_type.replace("_", "") in normalized
 
 
 def has_dealbreaker(job: Job, dealbreakers: List[str]) -> bool:
@@ -135,8 +180,12 @@ def score_jobs(
     if not candidate_jobs:
         return []
 
-    feedback = negative_feedback or {"companies": set(), "titles": []}
+    feedback = negative_feedback or {}
     disliked_companies: Set[str] = feedback.get("companies", set())
+    disliked_titles = feedback.get("titles", [])
+    disliked_locations = feedback.get("locations", [])
+    liked_companies: Set[str] = feedback.get("liked_companies", set())
+    liked_titles = feedback.get("liked_titles", [])
 
     # Build profile text representation
     profile_skills_text = " ".join(profile.skills)
@@ -184,8 +233,37 @@ def score_jobs(
         feedback_penalty = 0.0
         if job.company.lower().strip() in disliked_companies:
             feedback_penalty += 0.3
+        normalized_title = " ".join(re.findall(r"[a-z0-9]+", job.title.lower()))
+        title_tokens = set(normalized_title.split())
+        if any(
+            normalized_title == title
+            or (
+                title_tokens
+                and len(title_tokens & set(title.split())) / len(title_tokens | set(title.split())) >= 0.6
+            )
+            for title in disliked_titles
+        ):
+            feedback_penalty += 0.2
+        if any(location in job.location.lower() for location in disliked_locations):
+            feedback_penalty += 0.15
 
-        final_score = max(0.0, base_sim + skill_boost + recency_boost - feedback_penalty)
+        feedback_boost = 0.0
+        if job.company.lower().strip() in liked_companies:
+            feedback_boost += 0.1
+        if any(
+            normalized_title == title
+            or (
+                title_tokens
+                and len(title_tokens & set(title.split())) / len(title_tokens | set(title.split())) >= 0.6
+            )
+            for title in liked_titles
+        ):
+            feedback_boost += 0.1
+
+        final_score = max(
+            0.0,
+            base_sim + skill_boost + recency_boost + feedback_boost - feedback_penalty,
+        )
         results.append((job, final_score, matched_skills, missing_skills))
 
     results.sort(key=lambda x: x[1], reverse=True)
@@ -217,7 +295,11 @@ def match_for_user(
             continue
         if not matches_location(job, profile.locations):
             continue
-        if not matches_role_family(job, profile.target_roles):
+        if not matches_role_family(job, profile.target_roles, profile.custom_titles):
+            continue
+        if not matches_work_mode(job, profile.work_modes):
+            continue
+        if not matches_job_type(job, profile.job_types):
             continue
         if has_dealbreaker(job, profile.dealbreakers):
             continue

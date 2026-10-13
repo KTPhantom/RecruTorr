@@ -50,6 +50,11 @@ def build_job_keyboard(job: Job, action_state: Optional[str] = None) -> InlineKe
             [InlineKeyboardButton("🔗 Apply", url=job.apply_url)],
             [InlineKeyboardButton("❌ Marked Not Relevant (Tuned)", callback_data="noop")],
         ]
+    elif action_state == "liked":
+        buttons = [
+            [InlineKeyboardButton("🔗 Apply", url=job.apply_url)],
+            [InlineKeyboardButton("💚 More like this saved", callback_data="noop")],
+        ]
     elif action_state == "remind":
         buttons = [
             [InlineKeyboardButton("🔗 Apply", url=job.apply_url)],
@@ -66,6 +71,9 @@ def build_job_keyboard(job: Job, action_state: Optional[str] = None) -> InlineKe
                 InlineKeyboardButton("✅ Applied", callback_data=f"act:applied:{job.job_id}"),
                 InlineKeyboardButton("❌ Not relevant", callback_data=f"act:not_relevant:{job.job_id}"),
             ],
-            [InlineKeyboardButton("⏰ Remind me", callback_data=f"act:remind:{job.job_id}")],
+            [
+                InlineKeyboardButton("⏰ Remind me", callback_data=f"act:remind:{job.job_id}"),
+                InlineKeyboardButton("💚 More like this", callback_data=f"act:like:{job.job_id}"),
+            ],
         ]
     return InlineKeyboardMarkup(buttons)

@@ -23,3 +23,7 @@ services:
         value: https://openrouter.ai/api/v1
       - key: LLM_MODEL
         value: meta-llama/llama-3.1-8b-instruct:free
+      - key: LLM_EXPLANATIONS_ENABLED
+        value: "false"
+      - key: LLM_RESUME_PARSING_ENABLED
+        value: "false"

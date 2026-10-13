@@ -369,16 +369,34 @@ def record_application_event(
 
 
 def get_user_negative_feedback(conn: Any, user_id: str) -> Dict[str, Any]:
-    """Retrieve companies and titles marked 'not_relevant' to down-weight in matching."""
+    """Retrieve negative and positive job-card feedback for ranking."""
     rows = conn.execute(
-        """SELECT j.company, j.title FROM applications a
+        """SELECT j.company, j.title, j.location, a.reason FROM applications a
            JOIN jobs j ON a.job_id = j.job_id
            WHERE a.user_id = ? AND a.status = 'not_relevant'""",
         (str(user_id),),
     ).fetchall()
-    disliked_companies = {r["company"].lower() for r in rows}
-    disliked_titles = [r["title"].lower() for r in rows]
-    return {"companies": disliked_companies, "titles": disliked_titles}
+    liked_rows = conn.execute(
+        """SELECT j.company, j.title FROM applications a
+           JOIN jobs j ON a.job_id = j.job_id
+           WHERE a.user_id = ? AND a.status = 'liked'""",
+        (str(user_id),),
+    ).fetchall()
+    return {
+        "companies": {
+            r["company"].lower()
+            for r in rows
+            if r["reason"] in {None, "other"}
+        },
+        "titles": [r["title"].lower() for r in rows],
+        "locations": [
+            r["location"].lower()
+            for r in rows
+            if r["reason"] == "location" and r["location"]
+        ],
+        "liked_companies": {r["company"].lower() for r in liked_rows},
+        "liked_titles": [r["title"].lower() for r in liked_rows],
+    }
 
 
 def get_user_applied_jobs(conn: Any, user_id: str) -> List[Any]:

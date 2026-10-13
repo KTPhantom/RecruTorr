@@ -16,6 +16,7 @@ def test_domain_authenticity():
     assert check_domain_authenticity("https://boards.greenhouse.io/stripe/jobs/123") is True
     assert check_domain_authenticity("https://jobs.lever.co/figma/abc") is True
     assert check_domain_authenticity("https://jobs.ashbyhq.com/postman/xyz") is True
+    assert check_domain_authenticity("https://careers.smartrecruiters.com/acme/123") is True
     assert check_domain_authenticity("https://careers.google.com/jobs/1", allowed_domains=["google.com"]) is True
     # Non-authentic / third-party scraping domains
     assert check_domain_authenticity("https://sketchy-job-board.xyz/jobs/1") is False

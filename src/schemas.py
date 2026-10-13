@@ -107,7 +107,12 @@ class Profile:
     projects: List[ProjectItem] = field(default_factory=list)
     experience: List[ExperienceItem] = field(default_factory=list)
     target_roles: List[str] = field(default_factory=list)  # e.g. ["sde", "data", "ml", "qa", "product"]
+    custom_titles: List[str] = field(default_factory=list)
     locations: List[str] = field(default_factory=list)     # e.g. ["bangalore", "remote"]
+    work_modes: List[str] = field(default_factory=list)    # e.g. ["remote", "hybrid"]
+    job_types: List[str] = field(default_factory=list)     # e.g. ["internship", "full_time"]
+    digest_frequency: str = "daily"
+    preferences_configured: bool = False
     min_stipend_inr: int = 0
     dealbreakers: List[str] = field(default_factory=list)  # e.g. ["unpaid", "bond", "service-company"]
     avoid_companies: List[str] = field(default_factory=list)
@@ -123,7 +128,12 @@ class Profile:
             "projects": [asdict(p) for p in self.projects],
             "experience": [asdict(e) for e in self.experience],
             "target_roles": self.target_roles,
+            "custom_titles": self.custom_titles,
             "locations": self.locations,
+            "work_modes": self.work_modes,
+            "job_types": self.job_types,
+            "digest_frequency": self.digest_frequency,
+            "preferences_configured": self.preferences_configured,
             "min_stipend_inr": self.min_stipend_inr,
             "dealbreakers": self.dealbreakers,
             "avoid_companies": self.avoid_companies,
@@ -149,7 +159,12 @@ class Profile:
             projects=projects,
             experience=experience,
             target_roles=data.get("target_roles", []),
+            custom_titles=data.get("custom_titles", []),
             locations=data.get("locations", []),
+            work_modes=data.get("work_modes", []),
+            job_types=data.get("job_types", []),
+            digest_frequency=data.get("digest_frequency", "daily"),
+            preferences_configured=data.get("preferences_configured", False),
             min_stipend_inr=data.get("min_stipend_inr", 0),
             dealbreakers=data.get("dealbreakers", []),
             avoid_companies=data.get("avoid_companies", []),

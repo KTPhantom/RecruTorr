@@ -1,5 +1,8 @@
 """Unit tests for Resume Parser, Explainer, and Delivery formatters."""
+from unittest.mock import Mock
+
 from src.delivery import build_job_keyboard, format_job_card
+from src import explainer
 from src.explainer import explain_match
 from src.resume_parser import heuristic_parse_resume
 from src.schemas import Job, Profile
@@ -49,6 +52,26 @@ def test_explainer_honest_rules():
     assert any(term in fit.fit_summary.lower() for term in ["python", "react", "skills", "razorpay", "bengaluru"])
 
 
+def test_llm_explanations_are_opt_in(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_EXPLANATIONS_ENABLED", raising=False)
+    generate = Mock()
+    monkeypatch.setattr(explainer, "generate_llm_explanation", generate)
+
+    result = explain_match(Profile(user_id="user"), Job(
+        company="Example",
+        title="Software Engineer",
+        location="Remote",
+        description="Python",
+        apply_url="https://jobs.lever.co/example/1",
+        source="lever",
+        external_id="1",
+    ))
+
+    assert result.fit_summary
+    generate.assert_not_called()
+
+
 def test_delivery_formatting():
     job = Job(
         company="Postman",
@@ -73,3 +96,4 @@ def test_delivery_formatting():
     assert buttons[1][0].callback_data.startswith("act:applied:")
     assert buttons[1][1].callback_data.startswith("act:not_relevant:")
     assert buttons[2][0].callback_data.startswith("act:remind:")
+    assert buttons[2][1].callback_data.startswith("act:like:")
