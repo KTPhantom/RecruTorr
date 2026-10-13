@@ -1,8 +1,8 @@
 """Agent 8: Orchestrator
 
 Coordinates the end-to-end pipeline:
-1. Read companies.yaml
-2. Fetch jobs from Greenhouse, Lever, Ashby
+1. Read companies.yaml and rss_sources.yaml
+2. Fetch configured ATS boards and RSS/Atom feeds
 3. Run Verifier (deterministic rules)
 4. Store verified & rejected jobs in the database
 5. For each active user: Match -> Explain -> Deliver
@@ -23,7 +23,7 @@ import yaml
 from src import db
 from src.delivery import build_job_keyboard, format_job_card
 from src.explainer import explain_match
-from src.fetchers import ashby, greenhouse, lever, smartrecruiters
+from src.fetchers import ashby, greenhouse, lever, rss, smartrecruiters
 from src.matcher import match_for_user
 from src.schemas import Job, Profile
 from src.verifier import verify_and_deduplicate
@@ -32,6 +32,7 @@ log = logging.getLogger("orchestrator")
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPANIES_FILE = ROOT / "companies.yaml"
+RSS_SOURCES_FILE = ROOT / "rss_sources.yaml"
 MAX_CONCURRENT_FETCHES = 5
 
 
@@ -65,15 +66,39 @@ def _fetch_company_board(company: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def fetch_and_verify_all(conn: Any, companies_config_path: Optional[Path] = None) -> Dict[str, Any]:
+def _fetch_rss_source(source: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch one RSS source and return timing/error data."""
+    name = source.get("name", "unnamed RSS source") if isinstance(source, dict) else "invalid RSS source"
+    started = time.perf_counter()
+    try:
+        if not isinstance(source, dict):
+            raise ValueError("Each RSS source must be a mapping")
+        return {
+            "jobs": rss.fetch(source),
+            "error": None,
+            "elapsed": time.perf_counter() - started,
+        }
+    except Exception as exc:
+        return {
+            "jobs": [],
+            "error": str(exc),
+            "elapsed": time.perf_counter() - started,
+        }
+
+
+def fetch_and_verify_all(
+    conn: Any,
+    companies_config_path: Optional[Path] = None,
+    rss_sources_config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Fetch from all configured sources and verify against rules."""
     c_path = companies_config_path or COMPANIES_FILE
     if not c_path.exists():
         log.warning("Companies config file not found: %s", c_path)
-        return {"fetched": 0, "verified": 0, "rejected": 0, "errors": []}
-
-    config = yaml.safe_load(c_path.read_text()) or {}
-    companies = config.get("companies", [])
+        companies = []
+    else:
+        config = yaml.safe_load(c_path.read_text(encoding="utf-8")) or {}
+        companies = config.get("companies", [])
 
     total_fetched = 0
     total_verified = 0
@@ -137,6 +162,59 @@ def fetch_and_verify_all(conn: Any, companies_config_path: Optional[Path] = None
         r_count = len(verified_batch) - v_count
         total_verified += v_count
         total_rejected += r_count
+
+    rss_path = rss_sources_config_path or RSS_SOURCES_FILE
+    rss_sources = []
+    if rss_path.exists():
+        rss_config = yaml.safe_load(rss_path.read_text(encoding="utf-8")) or {}
+        rss_sources = rss_config.get("rss_sources", [])
+        if not isinstance(rss_sources, list):
+            raise ValueError("rss_sources.yaml must contain a list named 'rss_sources'")
+
+    rss_fetched: Dict[int, Dict[str, Any]] = {}
+    if rss_sources:
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_CONCURRENT_FETCHES, len(rss_sources))
+        ) as executor:
+            futures = {
+                executor.submit(_fetch_rss_source, source): index
+                for index, source in enumerate(rss_sources)
+            }
+            for future in as_completed(futures):
+                rss_fetched[futures[future]] = future.result()
+
+    for index, source in enumerate(rss_sources):
+        name = (
+            source.get("name", f"RSS source {index + 1}")
+            if isinstance(source, dict)
+            else f"RSS source {index + 1}"
+        )
+        domains = source.get("domains", []) if isinstance(source, dict) else []
+        fetched = rss_fetched[index]
+        if fetched["error"]:
+            log.error(
+                "Failed fetching RSS source %s after %.2fs: %s",
+                name,
+                fetched["elapsed"],
+                fetched["error"],
+            )
+            errors.append({"company": name, "ats": "rss", "error": fetched["error"]})
+            continue
+
+        raw_jobs = fetched["jobs"]
+        total_fetched += len(raw_jobs)
+        log.info("Fetched RSS source %s: %d jobs in %.2fs", name, len(raw_jobs), fetched["elapsed"])
+        verify_started = time.perf_counter()
+        verified_batch = verify_and_deduplicate(raw_jobs, allowed_domains=domains)
+        db.save_jobs(conn, verified_batch, domains=domains)
+        log.info(
+            "Verified RSS source %s: %d jobs in %.2fs",
+            name,
+            len(verified_batch),
+            time.perf_counter() - verify_started,
+        )
+        total_verified += sum(1 for job in verified_batch if job.verified)
+        total_rejected += sum(1 for job in verified_batch if not job.verified)
 
     return {
         "fetched": total_fetched,

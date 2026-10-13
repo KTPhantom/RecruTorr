@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
 import json
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 
 @dataclass
@@ -17,7 +19,7 @@ class Job:
     location: str
     description: str
     apply_url: str
-    source: str  # "greenhouse" | "lever" | "ashby" | "manual"
+    source: str  # "greenhouse" | "lever" | "ashby" | "smartrecruiters" | "rss" | "manual"
     external_id: str
     remote: bool = False
     posted_at: Optional[datetime] = None
@@ -81,6 +83,28 @@ class Job:
             fetched_at=fetched_at,
             embedding=emb,
         )
+
+
+def canonicalize_job_url(url: str) -> str:
+    """Normalize a listing URL for cross-source duplicate detection."""
+    try:
+        parsed = urlsplit(url.strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname.lower().rstrip(".")
+        try:
+            ip = ipaddress.ip_address(hostname)
+            host = f"[{hostname}]" if ip.version == 6 else hostname
+        except ValueError:
+            host = hostname
+        port = parsed.port
+        if port and port != (443 if scheme == "https" else 80):
+            host = f"{host}:{port}"
+        path = parsed.path.rstrip("/") or "/"
+        return urlunsplit((scheme, host, path, "", ""))
+    except ValueError:
+        return ""
 
 
 @dataclass

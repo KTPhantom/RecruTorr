@@ -20,12 +20,15 @@ import asyncio
 import datetime
 import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
 import sys
 import time
+import uuid
 from typing import Any, List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -52,7 +55,8 @@ from src.explainer import explain_match
 from src.matcher import match_for_user
 from src.orchestrator import fetch_and_verify_all
 from src.resume_parser import parse_resume
-from src.schemas import Profile
+from src.schemas import Job, Profile, html_to_text, looks_remote
+from src.verifier import verify_job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -65,20 +69,23 @@ CONSENT_TEXT = (
     "🔒 *Privacy Notice:*\n"
     "• We only extract skills, projects, and role preferences from your resume.\n"
     "• Your data is used exclusively for job matching and is never sold or shared.\n"
+    "• Job links you submit are shared with configured moderators; approved public listings may be retained without your account details.\n"
     "• You can permanently delete all your data at any time with `/delete`.\n\n"
     "Do you consent to proceed?"
 )
 
 HELP_TEXT = (
     "📖 *How OffCampus Matcher Works:*\n\n"
-    "1️⃣ *Zero-Scam Verification:* We fetch directly from official company ATS systems (Greenhouse, Lever, Ashby). "
-    "Every job is checked by our deterministic verifier to filter out fee-based scams, senior roles (>3 yrs), and stale postings.\n\n"
+    "1️⃣ *Zero-Scam Verification:* We fetch from configured company ATS boards and RSS/Atom feeds. "
+    "Community-submitted links are reviewed by a moderator before they can be published. "
+    "Jobs are checked for fee-based scams, senior roles (>3 yrs), and stale postings.\n\n"
     "2️⃣ *AI-Powered Fit Notes:* For every matched job, our AI reviews your resume skills and highlights *Matched Skills* and *Missing Skills*.\n\n"
     "3️⃣ *Smart Feedback Loop:* Tapping *❌ Not relevant* immediately down-ranks similar roles and companies for your future digests.\n\n"
     "4️⃣ *Reminders & Tracking:* Tap *⏰ Remind me* to receive an automated ping in 24 hours, and track submissions with `/applied`.\n\n"
     "📌 *Commands Available:*\n"
     "• `/jobs` — Browse today's fresh verified matches\n"
     "• `/preferences` — Toggle your target roles & locations\n"
+    "• `/submitjob` — Submit a job link for admin review\n"
     "• `/profile` — View or update your resume details\n"
     "• `/applied` — View all jobs you've marked as applied\n"
     "• `/pause` & `/resume` — Control your daily digests\n"
@@ -87,6 +94,205 @@ HELP_TEXT = (
 
 
 # ---------- Command Handlers ----------
+
+def _admin_telegram_ids() -> set[int]:
+    """Read configured moderator IDs without accepting malformed values."""
+    configured = os.getenv("ADMIN_TELEGRAM_IDS", "")
+    admin_ids: set[int] = set()
+    for value in configured.replace(" ", ",").split(","):
+        if not value:
+            continue
+        try:
+            admin_ids.add(int(value))
+        except ValueError:
+            log.warning("Ignoring invalid ADMIN_TELEGRAM_IDS entry")
+    return admin_ids
+
+
+async def myid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the caller their own Telegram numeric ID for moderator setup."""
+    if update.message and update.effective_user:
+        await update.message.reply_text(
+            f"Your Telegram numeric ID is: {update.effective_user.id}"
+        )
+
+
+def _parse_submission_args(args: list[str]) -> Optional[dict[str, str]]:
+    fields = [value.strip() for value in " ".join(args).split("|", 4)]
+    if len(fields) not in {4, 5}:
+        return None
+    apply_url, title, company, location = fields[:4]
+    description = fields[4] if len(fields) == 5 else ""
+
+    try:
+        parsed = urlsplit(apply_url)
+        host = parsed.hostname
+        if (
+            parsed.scheme.lower() != "https"
+            or not host
+            or parsed.username
+            or parsed.password
+            or parsed.port not in (None, 443)
+            or any(character.isspace() or ord(character) < 33 for character in apply_url)
+            or "\\" in parsed.netloc
+        ):
+            return None
+        try:
+            if not ipaddress.ip_address(host).is_global:
+                return None
+        except ValueError:
+            labels = host.lower().rstrip(".").split(".")
+            valid_labels = all(
+                0 < len(label) <= 63
+                and label[0].isalnum()
+                and label[-1].isalnum()
+                and all(char.isalnum() or char == "-" for char in label)
+                for label in labels
+            )
+            if (
+                len(host) > 253
+                or len(labels) < 2
+                or not valid_labels
+                or host.lower().endswith((".local", ".internal"))
+            ):
+                return None
+    except ValueError:
+        return None
+
+    title = html_to_text(title)
+    company = html_to_text(company)
+    location = html_to_text(location)
+    description = html_to_text(description)
+    if not title or not company:
+        return None
+    if len(apply_url) > 2048 or len(title) > 240 or len(company) > 160:
+        return None
+    if len(location) > 240 or len(description) > 12000:
+        return None
+    return {
+        "apply_url": apply_url,
+        "title": title,
+        "company": company,
+        "location": location,
+        "description": description,
+    }
+
+
+async def submitjob_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Queue a student-submitted listing for explicit human review."""
+    if not update.message:
+        return
+    user = update.effective_user
+    admins = _admin_telegram_ids()
+    if not admins:
+        await update.message.reply_text(
+            "Job submissions are temporarily unavailable because admin review is not configured."
+        )
+        return
+
+    conn = db.get_db()
+    try:
+        account = db.get_user(conn, user.id)
+        if not account or not account["consent_at"]:
+            await update.message.reply_text("Please run /start and accept the consent notice first.")
+            return
+
+        submission = _parse_submission_args(ctx.args or [])
+        if not submission:
+            await update.message.reply_text(
+                "Use this format:\n"
+                "/submitjob https://company.example/jobs/1 | Job title | Company | Location | "
+                "Short description (optional)\n\n"
+                "Only HTTPS links are accepted. An admin will inspect the live listing before approval."
+            )
+            return
+
+        pending_count = conn.execute(
+            """SELECT COUNT(*) AS total FROM job_submissions
+               WHERE submitter_user_id = ? AND status = 'pending'""",
+            (str(user.id),),
+        ).fetchone()["total"]
+        if pending_count >= 5:
+            await update.message.reply_text(
+                "You already have five listings awaiting review. Please wait for those to be reviewed."
+            )
+            return
+
+        submission_id = uuid.uuid4().hex[:12]
+        created = db.create_job_submission(
+            conn,
+            submission_id=submission_id,
+            submitter_user_id=str(user.id),
+            **submission,
+        )
+        if not created:
+            await update.message.reply_text(
+                "That listing is already in the job database or has already been submitted for review."
+            )
+            return
+    finally:
+        conn.close()
+
+    await update.message.reply_text(
+        "✅ Your job listing is queued for admin review. It won't be shared unless it passes review."
+    )
+    notice = (
+        f"New job submission {submission_id}\n"
+        f"{submission['title']} — {submission['company']}\n"
+        f"Location: {submission['location'] or 'Not specified'}\n"
+        f"Apply link: {submission['apply_url']}\n\n"
+        "Inspect that the listing is live, authentic, and suitable for early-career applicants, "
+        "then use /reviewjobs to approve or reject it."
+    )
+    for admin_id in admins:
+        try:
+            await ctx.bot.send_message(chat_id=admin_id, text=notice, disable_web_page_preview=True)
+        except Exception:
+            log.exception("Could not notify a configured job-submission moderator")
+
+
+async def reviewjobs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show pending submissions to configured moderators only."""
+    if not update.message:
+        return
+    if update.effective_user.id not in _admin_telegram_ids():
+        await update.message.reply_text("You are not authorized to review job submissions.")
+        return
+
+    conn = db.get_db()
+    try:
+        submissions = db.get_pending_job_submissions(conn)
+    finally:
+        conn.close()
+
+    if not submissions:
+        await update.message.reply_text("There are no job submissions awaiting review.")
+        return
+
+    for submission in submissions:
+        text = (
+            f"Pending job submission {submission['submission_id']}\n"
+            f"{submission['title']} — {submission['company']}\n"
+            f"Location: {submission['location'] or 'Not specified'}\n"
+            f"Description: {submission['description'] or 'Not provided'}\n"
+            f"Apply link: {submission['apply_url']}"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✅ Approve",
+                callback_data=f"submission:approve:{submission['submission_id']}",
+            ),
+            InlineKeyboardButton(
+                "❌ Reject",
+                callback_data=f"submission:reject:{submission['submission_id']}",
+            ),
+        ]])
+        await update.message.reply_text(
+            text,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
@@ -864,6 +1070,122 @@ async def on_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode=ParseMode.MARKDOWN,
             )
 
+    elif kind == "submission":
+        action, _, submission_id = rest.partition(":")
+        if uid not in _admin_telegram_ids():
+            await q.answer("You are not authorized to review submissions.", show_alert=True)
+            conn.close()
+            return
+
+        try:
+            submission = db.get_job_submission(conn, submission_id)
+            if not submission or submission["status"] != "pending":
+                await q.answer("This submission has already been reviewed.", show_alert=True)
+                return
+
+            if action == "reject":
+                reviewed = db.review_job_submission(
+                    conn,
+                    submission_id,
+                    "rejected",
+                    str(uid),
+                    rejection_reason="Rejected by moderator",
+                )
+                response = "Submission rejected." if reviewed else "This submission was already reviewed."
+                user_notice = (
+                    "Your submitted job listing was reviewed and wasn't approved."
+                    if reviewed else None
+                )
+            elif action == "approve":
+                host = urlsplit(submission["apply_url"]).hostname or ""
+                job = Job(
+                    company=submission["company"],
+                    title=submission["title"],
+                    location=submission["location"] or "",
+                    description=submission["description"] or "",
+                    apply_url=submission["apply_url"],
+                    source="manual",
+                    external_id=submission_id,
+                    remote=looks_remote(
+                        submission["location"] or "",
+                        submission["title"],
+                        submission["description"] or "",
+                    ),
+                )
+                verified_job = verify_job(job, allowed_domains=[host])
+                if not verified_job.verified:
+                    reason = verified_job.reject_reason or "Failed the listing verification rules"
+                    reviewed = db.review_job_submission(
+                        conn,
+                        submission_id,
+                        "rejected",
+                        str(uid),
+                        rejection_reason=reason,
+                    )
+                    response = (
+                        f"Not approved: {reason}"
+                        if reviewed else "This submission was already reviewed."
+                    )
+                    user_notice = (
+                        "Your submitted job listing was reviewed but didn't pass the safety checks."
+                        if reviewed else None
+                    )
+                elif db.save_jobs(conn, [verified_job], domains=[host], commit=False) == 0:
+                    conn.rollback()
+                    db.review_job_submission(
+                        conn,
+                        submission_id,
+                        "rejected",
+                        str(uid),
+                        rejection_reason="Duplicate of an existing listing",
+                    )
+                    response = "Not approved: this listing is already in the job database."
+                    user_notice = "Your submitted job listing was already present, so it wasn't added again."
+                else:
+                    reviewed = db.review_job_submission(
+                        conn,
+                        submission_id,
+                        "approved",
+                        str(uid),
+                        job_id=verified_job.job_id,
+                        commit=False,
+                    )
+                    if reviewed:
+                        conn.commit()
+                        response = "Approved and added to verified job listings."
+                        user_notice = "Your submitted job listing was approved and added to the job pool."
+                    else:
+                        conn.rollback()
+                        response = "This submission was already reviewed."
+                        user_notice = None
+            else:
+                await q.answer("That review action is unavailable.", show_alert=True)
+                return
+
+            await q.answer(response[:180], show_alert=action == "approve" and response.startswith("Not approved"))
+            if q.message:
+                await q.edit_message_text(
+                    f"Submission {submission_id}: {response}\n\n"
+                    f"{submission['title']} — {submission['company']}\n"
+                    f"Apply link: {submission['apply_url']}"
+                )
+            if submission["submitter_user_id"] and user_notice:
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=int(submission["submitter_user_id"]),
+                        text=user_notice,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    log.exception("Could not notify the job submitter of the review result")
+        except Exception:
+            conn.rollback()
+            log.exception("Failed reviewing job submission %s", submission_id)
+            await q.answer("Review failed. Please retry or check the server logs.", show_alert=True)
+        finally:
+            conn.close()
+        return
+
     elif kind == "act":
         action, _, action_value = rest.partition(":")
 
@@ -958,11 +1280,14 @@ async def post_init(application: Application) -> None:
     """Register command menu."""
     commands = [
         BotCommand("start", "Start the bot & accept consent"),
+        BotCommand("myid", "Show your Telegram numeric ID"),
         BotCommand("jobs", "Find fresh verified job matches"),
         BotCommand("preferences", "Customize target roles & locations"),
+        BotCommand("submitjob", "Submit a job link for admin review"),
         BotCommand("profile", "View or update your resume details"),
         BotCommand("applied", "View all jobs you marked as applied"),
         BotCommand("help", "How the bot works & guide"),
+        BotCommand("reviewjobs", "Review community job submissions (admins)"),
         BotCommand("pause", "Pause daily morning digests"),
         BotCommand("resume", "Resume daily morning digests"),
         BotCommand("delete", "Permanently erase all your personal data"),
@@ -1083,10 +1408,13 @@ def run_bot() -> None:
 
     # Commands
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("profile", profile_cmd))
     app.add_handler(CommandHandler("preferences", preferences_cmd))
     app.add_handler(CommandHandler("jobs", jobs_cmd))
+    app.add_handler(CommandHandler("submitjob", submitjob_cmd))
+    app.add_handler(CommandHandler("reviewjobs", reviewjobs_cmd))
     app.add_handler(CommandHandler("applied", applied_cmd))
     app.add_handler(CommandHandler("pause", pause_cmd))
     app.add_handler(CommandHandler("resume", resume_cmd))

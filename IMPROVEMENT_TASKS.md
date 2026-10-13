@@ -4,6 +4,11 @@ Scope: combine the requested job-discovery, response-time, and user-personalizat
 
 ## Ordered work
 
+- [x] **Add configurable RSS and community submissions**
+  - Added opt-in RSS 2.0/Atom ingestion via `rss_sources.yaml`, with HTTPS feed URLs and per-feed allowed application domains.
+  - Added `/submitjob` and admin-only `/reviewjobs`; user submissions remain pending until a moderator inspects the live page, and approval runs the existing scam/seniority rules before publishing.
+  - Added canonical application-URL deduplication across ATS, RSS, and submitted jobs; `/delete` removes pending submitter records and anonymizes approved records.
+  - Configure `ADMIN_TELEGRAM_IDS` in the bot environment. Added public We Work Remotely category feeds for programming, design, DevOps, product, customer support, and sales/marketing; add only feeds you are permitted to use.
 - [x] **Broaden job-source coverage**
   - Added a paginated SmartRecruiters public postings adapter alongside Greenhouse, Lever, and Ashby, and enabled more verified Greenhouse company boards (Cloudflare, Datadog, Twilio, Reddit).
   - Keep source failures isolated, normalize jobs to the existing schema, and validate apply links through the verifier.
@@ -28,4 +33,4 @@ Scope: combine the requested job-discovery, response-time, and user-personalizat
 
 - [x] Task sheet and dependency-aware session checklist created.
 - [x] All requested implementation tasks completed.
-- [x] Verification complete: 25 tests passed; Python compile, YAML parsing, and `git diff --check` passed.
+- [x] Hybrid-source feature validation complete: 43 tests passed; compilation, YAML parsing, and `git diff --check` passed.

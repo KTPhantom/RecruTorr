@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.schemas import Job, Profile
+from src.schemas import Job, Profile, canonicalize_job_url
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "data.db")))
@@ -100,6 +100,31 @@ CREATE TABLE IF NOT EXISTS reminders (
     sent_at TEXT,
     PRIMARY KEY (user_id, job_id)
 );
+
+CREATE TABLE IF NOT EXISTS job_submissions (
+    submission_id TEXT PRIMARY KEY,
+    submitter_user_id TEXT,
+    company TEXT NOT NULL,
+    title TEXT NOT NULL,
+    location TEXT,
+    description TEXT,
+    apply_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    submitted_at TEXT NOT NULL,
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    rejection_reason TEXT,
+    job_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_submissions_status
+    ON job_submissions(status, submitted_at);
+
+CREATE TABLE IF NOT EXISTS job_url_registry (
+    canonical_url TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL
+);
 """
 
 POSTGRES_SCHEMA = """
@@ -185,6 +210,31 @@ CREATE TABLE IF NOT EXISTS reminders (
     sent_at TEXT,
     PRIMARY KEY (user_id, job_id)
 );
+
+CREATE TABLE IF NOT EXISTS job_submissions (
+    submission_id TEXT PRIMARY KEY,
+    submitter_user_id TEXT,
+    company TEXT NOT NULL,
+    title TEXT NOT NULL,
+    location TEXT,
+    description TEXT,
+    apply_url TEXT NOT NULL,
+    canonical_url TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    submitted_at TEXT NOT NULL,
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    rejection_reason TEXT,
+    job_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_submissions_status
+    ON job_submissions(status, submitted_at);
+
+CREATE TABLE IF NOT EXISTS job_url_registry (
+    canonical_url TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL
+);
 """
 
 
@@ -199,6 +249,9 @@ class PostgresConnection:
 
     def commit(self) -> None:
         self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
 
     def close(self) -> None:
         self._connection.close()
@@ -262,6 +315,15 @@ def set_user_paused(conn: Any, telegram_id: int, paused: bool) -> None:
 
 def delete_user_data(conn: Any, telegram_id: int) -> None:
     uid = str(telegram_id)
+    conn.execute(
+        "DELETE FROM job_submissions WHERE submitter_user_id = ? AND status != 'approved'",
+        (uid,),
+    )
+    conn.execute(
+        "UPDATE job_submissions SET submitter_user_id = NULL "
+        "WHERE submitter_user_id = ? AND status = 'approved'",
+        (uid,),
+    )
     conn.execute("DELETE FROM reminders WHERE user_id = ?", (uid,))
     conn.execute("DELETE FROM applications WHERE user_id = ?", (uid,))
     conn.execute("DELETE FROM matches WHERE user_id = ?", (uid,))
@@ -299,8 +361,39 @@ def get_all_active_users(conn: Any) -> List[Any]:
 
 # --- Job Helpers ---
 
-def save_jobs(conn: Any, jobs: List[Job], domains: Optional[List[str]] = None) -> None:
+def save_jobs(
+    conn: Any,
+    jobs: List[Job],
+    domains: Optional[List[str]] = None,
+    commit: bool = True,
+) -> int:
+    saved = 0
+    existing_rows = conn.execute(
+        "SELECT job_id, apply_url FROM jobs WHERE verified = 1"
+    ).fetchall()
+    for row in existing_rows:
+        canonical_url = canonicalize_job_url(row["apply_url"])
+        if canonical_url:
+            conn.execute(
+                """INSERT INTO job_url_registry (canonical_url, job_id)
+                   VALUES (?, ?) ON CONFLICT(canonical_url) DO NOTHING""",
+                (canonical_url, row["job_id"]),
+            )
+
     for j in jobs:
+        canonical_url = canonicalize_job_url(j.apply_url)
+        if canonical_url and j.verified:
+            conn.execute(
+                """INSERT INTO job_url_registry (canonical_url, job_id)
+                   VALUES (?, ?) ON CONFLICT(canonical_url) DO NOTHING""",
+                (canonical_url, j.job_id),
+            )
+            owner = conn.execute(
+                "SELECT job_id FROM job_url_registry WHERE canonical_url = ?",
+                (canonical_url,),
+            ).fetchone()
+            if owner and owner["job_id"] != j.job_id:
+                continue
         d = j.to_dict()
         emb_str = json.dumps(j.embedding) if j.embedding else None
         domains_str = json.dumps(domains or [])
@@ -331,7 +424,95 @@ def save_jobs(conn: Any, jobs: List[Job], domains: Optional[List[str]] = None) -
                 domains_str, emb_str, d["fetched_at"],
             ),
         )
+        saved += 1
+    if commit:
+        conn.commit()
+    return saved
+
+
+def create_job_submission(
+    conn: Any,
+    submission_id: str,
+    submitter_user_id: str,
+    company: str,
+    title: str,
+    location: str,
+    description: str,
+    apply_url: str,
+) -> bool:
+    """Queue a user-submitted listing unless its URL is already known."""
+    canonical_url = canonicalize_job_url(apply_url)
+    if not canonical_url:
+        return False
+    existing_jobs = conn.execute(
+        "SELECT apply_url FROM jobs WHERE verified = 1"
+    ).fetchall()
+    if any(canonicalize_job_url(row["apply_url"]) == canonical_url for row in existing_jobs):
+        return False
+
+    cursor = conn.execute(
+        """INSERT INTO job_submissions (
+               submission_id, submitter_user_id, company, title, location,
+               description, apply_url, canonical_url, status, submitted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+           ON CONFLICT(canonical_url) DO NOTHING""",
+        (
+            submission_id,
+            str(submitter_user_id),
+            company,
+            title,
+            location,
+            description,
+            apply_url,
+            canonical_url,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
     conn.commit()
+    return cursor.rowcount == 1
+
+
+def get_pending_job_submissions(conn: Any) -> List[Any]:
+    return conn.execute(
+        """SELECT * FROM job_submissions WHERE status = 'pending'
+           ORDER BY submitted_at, submission_id LIMIT 20"""
+    ).fetchall()
+
+
+def get_job_submission(conn: Any, submission_id: str) -> Optional[Any]:
+    return conn.execute(
+        "SELECT * FROM job_submissions WHERE submission_id = ?",
+        (submission_id,),
+    ).fetchone()
+
+
+def review_job_submission(
+    conn: Any,
+    submission_id: str,
+    status: str,
+    reviewed_by: str,
+    rejection_reason: Optional[str] = None,
+    job_id: Optional[str] = None,
+    commit: bool = True,
+) -> bool:
+    if status not in {"approved", "rejected"}:
+        raise ValueError("Submission review status must be approved or rejected")
+    cursor = conn.execute(
+        """UPDATE job_submissions SET
+               status = ?, reviewed_by = ?, reviewed_at = ?, rejection_reason = ?, job_id = ?
+           WHERE submission_id = ? AND status = 'pending'""",
+        (
+            status,
+            str(reviewed_by),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            rejection_reason,
+            job_id,
+            submission_id,
+        ),
+    )
+    if commit:
+        conn.commit()
+    return cursor.rowcount == 1
 
 
 def get_verified_jobs(conn: Any) -> List[Job]:

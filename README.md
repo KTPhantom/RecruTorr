@@ -6,7 +6,7 @@ A zero-cost, privacy-first Telegram bot that delivers authentic, verified off-ca
 
 ## 🛠️ System Architecture
 
-1. **Source Fetchers (`src/fetchers/`)**: Pulls jobs from Greenhouse, Lever, Ashby, and SmartRecruiters public job-board endpoints.
+1. **Source Fetchers (`src/fetchers/`)**: Pulls jobs from configured Greenhouse, Lever, Ashby, SmartRecruiters, and RSS/Atom sources.
 2. **Verifier (`src/verifier.py`)**: Deterministic rules rejecting scams/fees, stale postings (>30d), unauthorized domains, senior roles (3+ yrs), and duplicates.
 3. **Resume Parser (`src/resume_parser.py`)**: Converts uploaded PDF resumes into structured `Profile` JSON (LLM with deterministic fallback).
 4. **Matcher (`src/matcher.py`)**: Applies hard filters (role family, location/remote, dealbreakers, avoided companies) and ranks with TF-IDF similarity + skill-overlap boost + feedback penalties.
@@ -27,14 +27,19 @@ pip install -r requirements.txt
 ### 2. Configure Companies
 Edit `companies.yaml` to specify company names, ATS types (`greenhouse`, `lever`, `ashby`, `smartrecruiters`), board slugs/company identifiers, and allowed domains. The included config has additional Greenhouse boards (Cloudflare, Datadog, Twilio, Reddit). For SmartRecruiters, the identifier is the company slug in its career-site URL (for example, `careers.smartrecruiters.com/<identifier>`). Add only board identifiers and domains that you have verified.
 
-### 3. Fetch & Verify Jobs
+### 3. Configure RSS/Atom Feeds (Optional)
+`rss_sources.yaml` includes public We Work Remotely feeds for programming, design, DevOps, product, customer support, and sales/marketing. The RSS titles include the employer prefix, which is parsed into the company field; the feed's region is used as the job location. Listings are checked against the `weworkremotely.com` allowed domain and the normal freshness, fee/scam, and early-career verification rules.
+
+You can add other feeds you are permitted to use. Each feed must use HTTPS and list the allowed application-link domains. RSS items must have a title and application URL, and will be checked against those domains before matching. The `company` and `location` values are defaults; RSS items with their own company/location fields take precedence. Set `company_in_title: true` for feeds that use a `Company: Role` title format. A feed error is isolated and does not stop other sources. Run `python -m src.run_fetch` or the scheduled GitHub Action to ingest new entries.
+
+### 4. Fetch & Verify Jobs
 Run the daily fetch and verification pipeline:
 ```bash
 python -m src.run_fetch
 ```
-This populates `data.db` with verified fresher-friendly jobs.
+This populates the database with verified fresher-friendly jobs. Listings with the same canonical application URL are stored only once across ATS, RSS, and user-submitted sources.
 
-### 4. Run the Telegram Bot
+### 5. Run the Telegram Bot
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram and get your API token.
 2. Set the token and run:
 ```bash
@@ -54,6 +59,8 @@ python -m bot.main
    - Run `/jobs` to browse matched openings with fit notes and action buttons.
    - Tap **Not relevant** and choose a reason, or use **More like this**, to tune future recommendations.
    - Check `/applied` to view all jobs you have marked as applied.
+   - Submit a possible opening with `/submitjob https://company.example/jobs/1 | Job title | Company | Location | Short description`. Use the literal `|` separators. Submission requires consent and an HTTPS link.
+   - Admins can review pending links with `/reviewjobs`. Get your numeric Telegram ID by sending `/myid` to the bot, then set `ADMIN_TELEGRAM_IDS` to a comma-separated list of moderator IDs. Before approving, inspect the live listing and its application link; approval still runs the bot's scam, seniority, and duplicate checks. Unreviewed submissions are never shown to job seekers.
    - Run `/delete` anytime to delete all your personal data.
 
 ### Free deployment on Render
@@ -67,6 +74,7 @@ This setup uses a Render free web service, a free Neon PostgreSQL database, and 
    - `TELEGRAM_BOT_TOKEN`: your token from [@BotFather](https://t.me/BotFather).
    - `WEBHOOK_SECRET`: a random secret containing only letters, numbers, `_`, or `-`.
    - `SCHEDULER_SECRET`: a separate random secret.
+   - `ADMIN_TELEGRAM_IDS`: comma-separated numeric Telegram user IDs for moderators (for example, `123456789`). Without this, `/submitjob` is disabled.
    - `OPENAI_API_KEY` is optional. To avoid per-match network delays, fit notes use deterministic rules by default. Set `LLM_EXPLANATIONS_ENABLED=true` to opt in to model-generated fit notes. Resume parsing remains heuristic by default; set `LLM_RESUME_PARSING_ENABLED=true` to opt in. Optional LLM requests have an 8-second timeout and no automatic retries; use a model available to your provider.
 4. After the first successful deploy, copy the service's public URL, such as `https://recru-torr-bot.onrender.com`.
 5. In GitHub, open **Settings → Secrets and variables → Actions → New repository secret** and add:

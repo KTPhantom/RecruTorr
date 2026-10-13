@@ -1,0 +1,38 @@
+# We Work Remotely publishes these public category feeds. Its job titles use
+# "Company: Role" and entries link to weworkremotely.com job detail pages.
+rss_sources:
+  - name: We Work Remotely - Programming
+    url: https://weworkremotely.com/categories/remote-programming-jobs.rss
+    company_in_title: true
+    domains:
+      - weworkremotely.com
+
+  - name: We Work Remotely - Design
+    url: https://weworkremotely.com/categories/remote-design-jobs.rss
+    company_in_title: true
+    domains:
+      - weworkremotely.com
+
+  - name: We Work Remotely - DevOps and Sysadmin
+    url: https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
+    company_in_title: true
+    domains:
+      - weworkremotely.com
+
+  - name: We Work Remotely - Product
+    url: https://weworkremotely.com/categories/remote-product-jobs.rss
+    company_in_title: true
+    domains:
+      - weworkremotely.com
+
+  - name: We Work Remotely - Customer Support
+    url: https://weworkremotely.com/categories/remote-customer-support-jobs.rss
+    company_in_title: true
+    domains:
+      - weworkremotely.com
+
+  - name: We Work Remotely - Sales and Marketing
+    url: https://weworkremotely.com/categories/remote-sales-and-marketing-jobs.rss
+    company_in_title: true
+    domains:
+      - weworkremotely.com

@@ -17,6 +17,8 @@ services:
         sync: false
       - key: SCHEDULER_SECRET
         sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_BASE_URL
